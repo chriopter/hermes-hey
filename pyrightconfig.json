@@ -1,0 +1,9 @@
+{
+  "include": ["hey_platform", "tests"],
+  "extraPaths": [".hermes-agent-src"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": false
+}

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-hey"
+version = "0.1.1"
+description = "Native HEY email platform adapter for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Christopher"}]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=6"]
+
+[project.entry-points."hermes_agent.plugins"]
+hey-platform = "hey_platform"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hey_platform"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["N999"]
+"hey_platform/__init__.py" = ["N999"]
