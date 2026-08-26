@@ -130,8 +130,14 @@ func (a sdkAdapter) CreateComment(ctx context.Context, threadID int64, content s
 	if err != nil {
 		return err
 	}
-	if response == nil || response.StatusCode != http.StatusFound && response.StatusCode != http.StatusSeeOther {
-		return fmt.Errorf("comment response was not a redirect")
+	if response == nil {
+		return fmt.Errorf("comment response was missing")
+	}
+	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+		return nil
+	}
+	if response.StatusCode != http.StatusFound && response.StatusCode != http.StatusSeeOther {
+		return fmt.Errorf("comment response was not successful")
 	}
 	location, err := url.Parse(response.Location)
 	if err != nil || location.User != nil || location.Path != fmt.Sprintf("/topics/%d", threadID) {

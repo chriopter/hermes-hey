@@ -8,6 +8,7 @@
 - Dispatch authorized HEY Collab comments as durable assignments and answer them only with same-thread Collab comments, never email
 - Read typed comments directly from topic entries without calling `Messages.Get` for comment IDs
 - Add exact `message|comment` event typing, migrate legacy pending events to `message`, and bump the sidecar wire protocol to version 2
+- Treat SDK-confirmed non-redirect `2xx` Collab-comment responses as successful mutations
 
 ## 0.2.0 - 2026-08-25
 

@@ -44,6 +44,20 @@ func TestSDKCreateCommentUsesOfficialFormEndpoint(t *testing.T) {
 	}
 }
 
+func TestSDKCreateCommentAcceptsSuccessfulNonRedirectResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := hey.DefaultConfig()
+	cfg.BaseURL = server.URL
+	client := hey.NewClient(cfg, &hey.StaticTokenProvider{Token: "synthetic-token"}, hey.WithMaxRetries(0))
+	if err := (sdkAdapter{client: client}).CreateComment(context.Background(), 77, "Internal response"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSDKCreateCommentRejectsUnexpectedRedirect(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "/topics/88")
