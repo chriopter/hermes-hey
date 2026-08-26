@@ -3,6 +3,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from hey_platform import plugin as plugin_module
 from hey_platform.plugin import apply_yaml_config, register
 
@@ -27,6 +29,16 @@ def test_register_exposes_fail_closed_hey_platform() -> None:
     assert "allow_all_env" not in registration
     assert registration["allow_update_command"] is False
     assert registration["max_message_length"] > 0
+
+
+def test_requirements_check_is_passive_and_config_independent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        plugin_module.shutil,
+        "which",
+        lambda _name: pytest.fail("passive requirements check must not inspect PATH"),
+    )
+
+    assert plugin_module.check_requirements() is True
 
 
 def test_register_seeds_quiet_email_display_defaults(monkeypatch) -> None:
@@ -92,10 +104,106 @@ def test_connected_check_requires_account_identity_and_cli_credentials(tmp_path,
     assert plugin_module.is_connected(missing_identity) is False
 
 
+def test_platform_registry_creates_adapter_with_configured_executable_outside_path(
+    tmp_path, monkeypatch
+) -> None:
+    from gateway.platform_registry import PlatformEntry, PlatformRegistry
+
+    sidecar = tmp_path / "private" / "hermes-hey-sidecar"
+    sidecar.parent.mkdir()
+    sidecar.write_text("#!/bin/sh\n")
+    sidecar.chmod(0o700)
+    monkeypatch.setattr(plugin_module.shutil, "which", lambda _name: None)
+    config = type(
+        "Config",
+        (),
+        {
+            "enabled": True,
+            "extra": {
+                "account": "12345",
+                "own_email": "agent@example.com",
+                "allow_from": ["authorized@example.com"],
+                "sidecar_binary": str(sidecar),
+            },
+        },
+    )()
+    context = FakeContext()
+    register(context)
+    registration = context.registration
+    assert registration is not None
+    registry = PlatformRegistry()
+    registry.register(PlatformEntry(source="builtin", **registration))
+
+    created = registry.create_adapter("hey", config)
+
+    assert created is not None
+    assert created.sidecar_binary == str(sidecar)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"account": "01"},
+        {"account": "9223372036854775808"},
+        {"account": "9" * 10_000},
+        {"account": 0},
+        {"account": 12345},
+        {"own_email": "not-an-email"},
+        {"allow_from": "authorized@example.com"},
+        {"allow_from": ["authorized@example.com", 7]},
+        {"allow_from": "authorized@example.com", "allow_all_users": True},
+        {"poll_interval": "0s"},
+        {"poll_interval": "eventually"},
+        {"watch_failure_threshold": 0},
+        {"watch_failure_threshold": 101},
+    ],
+)
+def test_validation_rejects_malformed_values_without_throwing(monkeypatch, override) -> None:
+    monkeypatch.setattr(plugin_module, "check_requirements", lambda: True)
+    extra = {
+        "account": "12345",
+        "own_email": "agent@example.com",
+        "allow_from": ["authorized@example.com"],
+        "poll_interval": "1s",
+        "watch_failure_threshold": 5,
+        **override,
+    }
+    config = type("Config", (), {"enabled": True, "extra": extra})()
+
+    assert plugin_module.validate_config(config) is False
+
+
+def test_validation_accepts_exact_go_int64_maximum(monkeypatch) -> None:
+    monkeypatch.setattr(plugin_module, "check_requirements", lambda: True)
+    config = type(
+        "Config",
+        (),
+        {
+            "enabled": True,
+            "extra": {
+                "account": "9223372036854775807",
+                "own_email": "agent@example.com",
+                "allow_from": ["authorized@example.com"],
+            },
+        },
+    )()
+
+    assert plugin_module.validate_config(config) is True
+
+
+def test_validation_returns_false_for_non_mapping_extra(monkeypatch) -> None:
+    monkeypatch.setattr(plugin_module, "check_requirements", lambda: True)
+    config = type("Config", (), {"enabled": True, "extra": ["invalid"]})()
+
+    assert plugin_module.validate_config(config) is False
+
+
 def test_interactive_setup_uses_real_hey_cli_flag(capsys) -> None:
     plugin_module.interactive_setup()
     output = capsys.readouterr().out
     assert "hey auth login --no-browser" in output
+    assert "HEY CLI v1.1.0" in output
+    assert "curl -fsSL https://hey.com/install-cli | bash" not in output
     assert "--remote" not in output
 
 
@@ -111,3 +219,27 @@ def test_wheel_entrypoint_is_lazy_package_module() -> None:
         project["project"]["entry-points"]["hermes_agent.plugins"]["hey-platform"]
         == "hey_platform"
     )
+
+
+def test_ci_builds_and_tests_pinned_go_sidecar() -> None:
+    workflow = (Path(__file__).parents[1] / ".github/workflows/tests.yml").read_text()
+
+    assert "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6" in workflow
+    assert "runs-on: ubuntu-24.04" in workflow
+    assert 'go-version: "1.26.7"' in workflow
+    assert "go test -race ./..." in workflow
+    assert "go vet ./..." in workflow
+    assert "go build -o /tmp/hermes-hey-sidecar ." in workflow
+    assert 'echo /tmp >> "$GITHUB_PATH"' in workflow
+    assert "uv sync --frozen --extra dev" in workflow
+    assert "Build wheel again from the source distribution" in workflow
+    assert "Test and build Go sidecar from the source distribution" in workflow
+    assert "Verify wheel and source-distribution parity" in workflow
+    assert "direct_payload == rebuilt_payload" in workflow
+    assert "Install and import both distribution formats" in workflow
+
+
+def test_readme_uses_exact_checksum_entry() -> None:
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+
+    assert 'sha256sum -c <(grep -Fx "$HEY_CLI_SHA256  $HEY_CLI_ARCHIVE" checksums.txt)' in readme

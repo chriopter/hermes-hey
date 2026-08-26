@@ -1,10 +1,10 @@
 name: hey-platform
 label: HEY
 kind: platform
-version: 0.1.1
+version: 0.2.0
 description: >
-  Native HEY email gateway adapter for Hermes Agent. Uses the official HEY CLI
-  watch stream, authorizes sender addresses before persistence, durably queues
-  accepted messages, routes one Hermes session per HEY thread, and sends one
+  Native HEY email gateway adapter for Hermes Agent. Uses Basecamp's official
+  HEY SDK through a durable Go sidecar, authorizes sender addresses before
+  persistence, routes one Hermes session per HEY thread, and sends one
   confirmed final reply back to the same thread.
 author: Christopher (chriopter)

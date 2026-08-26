@@ -4,12 +4,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
+import shutil
 import threading
 from collections.abc import AsyncIterator
 from contextvars import ContextVar
 from pathlib import Path
+from time import monotonic
 from typing import Any, ClassVar, Protocol
 
 from gateway.config import Platform
@@ -22,8 +23,14 @@ from gateway.platforms.base import (
 )
 from gateway.session import build_session_key
 
-from .client import HeyCLI, make_subprocess_runner
-from .core import HeyEvent, parse_context_id, strict_bool
+from .client import HeySDKClient, HeySDKWatch, canonical_account, make_sidecar_runner
+from .core import (
+    HeyEvent,
+    parse_context_id,
+    parse_event_frame,
+    parse_ready_frame,
+    strict_bool,
+)
 from .engine import DurableQueue
 
 logger = logging.getLogger(__name__)
@@ -43,78 +50,19 @@ async def run_blocking(func, /, *args, **kwargs):
 
 
 class HeyClient(Protocol):
-    def verify_version(self) -> bool: ...
-    def hydrate_event(self, raw: dict[str, Any]) -> HeyEvent | None: ...
+    def verify(self) -> bool: ...
     def reply(self, thread_id: int, text: str) -> dict[str, Any]: ...
 
 
-class HeyWatch:
-    """One official `hey watch` process, exposed as parsed NDJSON."""
-
-    def __init__(self, *, account: str, config_dir: str | None = None):
-        self.account = str(account)
-        self.config_dir = config_dir
-        self.process: asyncio.subprocess.Process | None = None
-        self._stderr_task: asyncio.Task | None = None
-
-    def _env(self) -> dict[str, str]:
-        env = {
-            key: os.environ[key]
-            for key in ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR")
-            if key in os.environ
-        }
-        if self.config_dir:
-            env["XDG_CONFIG_HOME"] = str(Path(self.config_dir).expanduser().resolve())
-        return env
-
-    async def _discard_stderr(self) -> None:
-        if not self.process or not self.process.stderr:
-            return
-        while await self.process.stderr.read(4096):
-            pass
-
-    async def lines(self) -> AsyncIterator[dict[str, Any]]:
-        self.process = await asyncio.create_subprocess_exec(
-            "hey",
-            "watch",
-            "--events",
-            "new",
-            "--account",
-            self.account,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._env(),
-        )
-        self._stderr_task = asyncio.create_task(self._discard_stderr())
-        assert self.process.stdout is not None
-        while line := await self.process.stdout.readline():
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                raise RuntimeError("HEY watch returned invalid JSON") from None
-            if isinstance(value, dict):
-                yield value
-        code = await self.process.wait()
-        if self._stderr_task:
-            await self._stderr_task
-        if code != 0:
-            raise RuntimeError(f"HEY watch failed (exit {code})")
-        raise RuntimeError("HEY watch stopped unexpectedly")
-
-    async def stop(self) -> None:
-        if self.process and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5)
-            except TimeoutError:
-                self.process.kill()
-                await self.process.wait()
-        if self._stderr_task and not self._stderr_task.done():
-            await self._stderr_task
+class HeyWatcher(Protocol):
+    def lines(self) -> AsyncIterator[dict[str, Any]]: ...
+    async def ack(self, event_id: str) -> None: ...
+    async def stop(self) -> None: ...
 
 
 class HeyAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False
+    WATCH_STABLE_SECONDS = 30.0
     _claim_lock = threading.RLock()
     _claims: ClassVar[dict[str, dict[int, str]]] = {}
     _live_adapters: ClassVar[dict[str, HeyAdapter]] = {}
@@ -123,16 +71,29 @@ class HeyAdapter(BasePlatformAdapter):
         self,
         config,
         *,
-        cli: HeyClient | None = None,
+        client: HeyClient | None = None,
         state_path: Path | None = None,
         platform: Platform | None = None,
     ):
-        super().__init__(config=config, platform=platform or Platform("hey"))
+        super().__init__(config=config, platform=platform or Platform.EMAIL)
         extra = getattr(config, "extra", {}) or {}
         extra.setdefault("group_sessions_per_user", False)
-        self.account = str(extra.get("account") or "").strip()
+        self.account = canonical_account(extra.get("account"))
+        self.account_id = int(self.account)
         self.own_email = str(extra.get("own_email") or "").strip().lower()
         self.config_dir = str(extra.get("config_dir") or "~/.config")
+        config_root = Path(self.config_dir).expanduser().resolve()
+        self.credential_dir = str(
+            Path(extra.get("credential_dir") or config_root / "hey-cli")
+            .expanduser()
+            .resolve()
+        )
+        self.sidecar_binary = str(
+            extra.get("sidecar_binary")
+            or shutil.which("hermes-hey-sidecar")
+            or "hermes-hey-sidecar"
+        )
+        self.poll_interval = str(extra.get("poll_interval") or "1s")
         configured = extra.get("allow_from") or []
         if isinstance(configured, str):
             configured = configured.split(",")
@@ -143,19 +104,26 @@ class HeyAdapter(BasePlatformAdapter):
         self.failure_threshold = max(
             1, min(100, int(extra.get("watch_failure_threshold", 5)))
         )
-        if cli is None:
-            runner = make_subprocess_runner(
-                account=self.account or None, config_dir=self.config_dir
-            )
-            cli = HeyCLI(runner, account=self.account, own_email=self.own_email)
-        self.cli = cli
         resolved_state_path = state_path
         if resolved_state_path is None:
             from hermes_constants import get_hermes_home
 
             resolved_state_path = get_hermes_home() / "state" / "hey-platform.json"
-        self.queue = DurableQueue(Path(resolved_state_path))
-        self._state_key = str(Path(resolved_state_path).resolve())
+        resolved_state_path = Path(resolved_state_path)
+        self.cursor_state_path = resolved_state_path.with_name("hey-sdk-cursors.json")
+        selected_client = client
+        if selected_client is None:
+            runner = make_sidecar_runner(
+                binary=self.sidecar_binary,
+                account=self.account,
+                credential_dir=self.credential_dir,
+            )
+            selected_client = HeySDKClient(
+                runner, account=self.account, own_email=self.own_email
+            )
+        self.client = selected_client
+        self.queue = DurableQueue(resolved_state_path)
+        self._state_key = str(resolved_state_path.resolve())
         self._inflight: set[str] = set()
         self._delivery_context: ContextVar[tuple[str, list[str]] | None] = ContextVar(
             "hey_delivery_context", default=None
@@ -164,16 +132,19 @@ class HeyAdapter(BasePlatformAdapter):
             "hey_final_send_allowed", default=False
         )
         self._watch_task: asyncio.Task | None = None
-        self._watch: HeyWatch | None = None
+        self._watch: HeyWatcher | None = None
         self._lock_acquired = False
-        self._credential_key = str(Path(self.config_dir).expanduser().resolve())
+        self._credential_key = self.credential_dir
 
     @property
     def name(self) -> str:
         return "HEY"
 
     def _authorized(self, event: HeyEvent) -> bool:
-        return self.allow_all_users or event.sender_email.lower() in self.allowed_senders
+        sender = event.sender_email.lower()
+        if not sender or sender == self.own_email:
+            return False
+        return self.allow_all_users or sender in self.allowed_senders
 
     def _claim(self, event: HeyEvent) -> bool:
         with self._claim_lock:
@@ -244,14 +215,12 @@ class HeyAdapter(BasePlatformAdapter):
         except ImportError:
             pass
         try:
-            verify_version = getattr(self.cli, "verify_version", None)
-            if not callable(verify_version):
-                raise TypeError("HEY client cannot verify CLI version")
-            await run_blocking(verify_version)
-            verify_identity = getattr(self.cli, "verify_identity", None)
-            if not callable(verify_identity):
-                raise TypeError("HEY client cannot verify authenticated identity")
-            await run_blocking(verify_identity)
+            verify = getattr(self.client, "verify", None)
+            if not callable(verify):
+                raise TypeError("HEY SDK client cannot verify identity and protocol")
+            verification = await run_blocking(verify)
+            if verification is not True:
+                raise RuntimeError("HEY SDK client verification did not return true")
             self._register_live_adapter()
             await self._drain_pending()
             self._watch_task = asyncio.create_task(self._watch_supervisor())
@@ -281,39 +250,76 @@ class HeyAdapter(BasePlatformAdapter):
     async def _watch_supervisor(self) -> None:
         failures = 0
         while True:
-            self._watch = HeyWatch(account=self.account, config_dir=self.config_dir)
+            started_at = monotonic()
+            watch = HeySDKWatch(
+                binary=self.sidecar_binary,
+                account=self.account,
+                own_email=self.own_email,
+                credential_dir=self.credential_dir,
+                cursor_state=str(self.cursor_state_path),
+                poll_interval=self.poll_interval,
+            )
+            self._watch = watch
+            retry_delay: int | None = None
+            ready_seen = False
             try:
-                async for raw in self._watch.lines():
-                    if raw.get("change") == "ready":
-                        failures = 0
-                        continue
-                    if raw.get("change") == "disconnected":
+                async for raw in watch.lines():
+                    if not ready_seen:
+                        try:
+                            parse_ready_frame(raw, HeySDKClient.PROTOCOL_VERSION)
+                        except ValueError as exc:
+                            raise RuntimeError(str(exc)) from None
+                        ready_seen = True
+                        await self._drain_pending()
                         continue
                     await self.process_watch_line(raw)
-                raise RuntimeError("HEY watch ended")
+                raise RuntimeError("HEY SDK watch ended")
             except asyncio.CancelledError:
                 raise
             except Exception:
+                if monotonic() - started_at >= self.WATCH_STABLE_SECONDS:
+                    failures = 0
                 failures += 1
-                logger.exception("HEY watch failed; reconnecting")
+                logger.exception("HEY SDK watch failed; reconnecting")
                 if failures >= self.failure_threshold:
                     self._set_fatal_error(
-                        "watch_failed", "HEY watch failed repeatedly", retryable=True
+                        "watch_failed", "HEY SDK watch failed repeatedly", retryable=True
                     )
                     await self._notify_fatal_error()
                     return
-                await asyncio.sleep(min(60, 2 ** (failures - 1)))
+                retry_delay = min(60, 2 ** (failures - 1))
+            finally:
+                try:
+                    await asyncio.shield(watch.stop())
+                except Exception:
+                    logger.exception("HEY SDK watch cleanup failed")
+                if self._watch is watch:
+                    self._watch = None
+            if retry_delay is not None:
+                await asyncio.sleep(retry_delay)
 
     async def process_watch_line(self, raw: dict[str, Any]) -> None:
-        event = await run_blocking(self.cli.hydrate_event, raw)
-        if event is None:
-            return
+        try:
+            event = parse_event_frame(raw)
+        except (KeyError, TypeError, ValueError) as exc:
+            if "invalid post-ready frame" in str(exc):
+                raise RuntimeError(str(exc)) from None
+            raise RuntimeError("HEY SDK watch returned an invalid event") from None
+        if event.account_id != self.account_id:
+            raise RuntimeError("HEY SDK watch event account does not match configuration")
         accepted = self.queue.ingest(event, self._authorized)
+        if self._watch is None:
+            raise RuntimeError("HEY SDK watch acknowledgement channel is unavailable")
+        await self._watch.ack(event.identity)
         if accepted:
             await self._drain_pending()
 
     async def _drain_pending(self) -> None:
         for event in self.queue.pending():
+            if event.account_id != self.account_id:
+                raise RuntimeError(
+                    "HEY pending event account does not match configuration"
+                )
             if not self._authorized(event):
                 self.queue.complete(event.identity)
                 self._inflight.discard(event.identity)
@@ -333,7 +339,7 @@ class HeyAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=event.sender_email,
             user_name=event.sender_name,
-            scope_id=str(event.account_id) if event.account_id else self.account,
+            scope_id=self.account,
             message_id=event.identity,
         )
         payload = {
@@ -395,7 +401,7 @@ class HeyAdapter(BasePlatformAdapter):
     @staticmethod
     def _retryable(error: str) -> bool:
         match = re.search(r"exit\s+(\d+)", error.lower())
-        return bool(match and int(match.group(1)) in {5, 6, 7})
+        return bool(match and int(match.group(1)) == 75)
 
     async def _send_with_retry(
         self,
@@ -403,7 +409,7 @@ class HeyAdapter(BasePlatformAdapter):
         content: str,
         reply_to: str | None = None,
         metadata: Any = None,
-        max_retries: int = 2,
+        max_retries: int = 3,
         base_delay: float = 2.0,
     ) -> SendResult:
         """Send only the final text response; acknowledge only its confirmed reply."""
@@ -441,7 +447,7 @@ class HeyAdapter(BasePlatformAdapter):
             )
         thread_id = parse_context_id(chat_id)
         try:
-            result = await run_blocking(self.cli.reply, thread_id, content)
+            result = await run_blocking(self.client.reply, thread_id, content)
         except RuntimeError as exc:
             error = str(exc)
             return SendResult(
@@ -450,9 +456,17 @@ class HeyAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("Unexpected HEY reply failure")
             return SendResult(success=False, error="HEY reply failed", retryable=False)
-        data = result.get("data") if isinstance(result, dict) else None
-        message_id = str(data.get("id")) if isinstance(data, dict) and data.get("id") else None
-        return SendResult(success=True, message_id=message_id, raw_response=result)
+        if (
+            type(result) is not dict
+            or set(result) != {"ok"}
+            or result.get("ok") is not True
+        ):
+            return SendResult(
+                success=False,
+                error="HEY SDK reply returned invalid response",
+                retryable=False,
+            )
+        return SendResult(success=True, raw_response=result)
 
     async def edit_message(
         self,

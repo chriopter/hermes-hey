@@ -9,9 +9,24 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.26.7"
+          cache-dependency-path: sidecar/go.sum
+      - name: Test Go SDK sidecar with race detector
+        working-directory: sidecar
+        run: go test -race ./...
+      - name: Vet Go SDK sidecar
+        working-directory: sidecar
+        run: go vet ./...
+      - name: Build Go SDK sidecar
+        working-directory: sidecar
+        run: |
+          go build -o /tmp/hermes-hey-sidecar .
+          echo /tmp >> "$GITHUB_PATH"
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - name: Check out Hermes Agent
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -21,9 +36,8 @@ jobs:
           path: .hermes-agent-src
       - name: Create environment
         run: |
-          uv venv
-          uv pip install -e '.[dev]'
-          uv pip install -e ./.hermes-agent-src
+          uv sync --frozen --extra dev
+          uv pip install --python .venv/bin/python -e ./.hermes-agent-src
       - name: Test
         env:
           HERMES_AGENT_SRC: ${{ github.workspace }}/.hermes-agent-src
@@ -36,5 +50,55 @@ jobs:
         run: uvx pyright==1.1.411
       - name: Plugin contract
         run: .venv/bin/hermes plugins doctor . --ci
-      - name: Build distributions
-        run: uvx --from build==1.5.0 pyproject-build
+      - name: Build distributions directly from the checkout
+        run: |
+          uvx --from build==1.5.0 pyproject-build --sdist
+          uvx --from build==1.5.0 pyproject-build --wheel
+      - name: Build wheel again from the source distribution
+        run: |
+          mkdir -p dist/sdist-tree dist/from-sdist
+          tar -xzf dist/hermes_hey-*.tar.gz -C dist/sdist-tree
+          source_tree="$(find dist/sdist-tree -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -n "$source_tree"
+          uvx --from build==1.5.0 pyproject-build --wheel --outdir dist/from-sdist "$source_tree"
+      - name: Test and build Go sidecar from the source distribution
+        run: |
+          source_tree="$(find dist/sdist-tree -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -n "$source_tree"
+          (cd "$source_tree/sidecar" && go test ./... && go build -trimpath -o /tmp/hermes-hey-sidecar-from-sdist .)
+      - name: Verify wheel and source-distribution parity
+        run: |
+          .venv/bin/python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          direct = next(Path("dist").glob("hermes_hey-*.whl"))
+          rebuilt = next(Path("dist/from-sdist").glob("hermes_hey-*.whl"))
+          def wheel_payload(path):
+              with ZipFile(path) as archive:
+                  return {
+                      name: archive.read(name)
+                      for name in archive.namelist()
+                      if not name.endswith("/RECORD")
+                  }
+
+          direct_payload = wheel_payload(direct)
+          rebuilt_payload = wheel_payload(rebuilt)
+          assert direct_payload == rebuilt_payload, (
+              direct_payload.keys() ^ rebuilt_payload.keys(),
+              [
+                  name
+                  for name in direct_payload.keys() & rebuilt_payload.keys()
+                  if direct_payload[name] != rebuilt_payload[name]
+              ],
+          )
+          PY
+      - name: Install and import both distribution formats
+        run: |
+          uv venv --python 3.11 .venv-wheel
+          uv venv --python 3.11 .venv-sdist
+          uv pip install --python .venv-wheel/bin/python dist/hermes_hey-*.whl
+          uv pip install --python .venv-sdist/bin/python dist/hermes_hey-*.tar.gz
+          for python in .venv-wheel/bin/python .venv-sdist/bin/python; do
+            "$python" -c 'from importlib.metadata import entry_points, version; import hey_platform; assert version("hermes-hey") == "0.2.0"; assert any(ep.name == "hey-platform" and ep.value == "hey_platform" for ep in entry_points(group="hermes_agent.plugins"))'
+          done

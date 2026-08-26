@@ -4,134 +4,112 @@ from datetime import UTC, datetime
 
 import pytest
 
-from hey_platform.core import HeyEvent, event_from_watch, parse_context_id
+from hey_platform.core import HeyEvent, parse_context_id, parse_ready_frame
 
 
-def sample_watch_event() -> dict:
+def event_dict() -> dict:
     return {
-        "change": "updated",
-        "at": "2026-08-25T16:10:00Z",
+        "event_id": "thread:456:entry:900",
         "posting_id": 123,
         "thread_id": 456,
-        "new": True,
-        "box": {"id": 7, "kind": "imbox", "name": "Imbox"},
-        "posting": {
-            "id": 123,
-            "name": "Please review",
-            "summary": "A request",
-            "account_id": 12345,
-            "active_at": "2026-08-25T16:09:59Z",
-            "visible_entry_count": 1,
-        },
+        "entry_id": 900,
+        "account_id": 12345,
+        "sender_id": 77,
+        "sender_name": "Synthetic Sender",
+        "sender_email": "sender@example.com",
+        "subject": "Synthetic subject",
+        "content": "Synthetic body",
+        "app_url": "https://app.hey.com/topics/456",
+        "created_at": "2026-08-25T16:09:59Z",
+        "box_kind": "imbox",
     }
 
 
-def sample_thread() -> list[dict]:
-    return [
-        {
-            "id": 900,
-            "created_at": "2026-08-25T16:09:59Z",
-            "creator": {
-                "id": 77,
-                "name": "Christopher",
-                "email_address": "authorized@example.com",
-            },
-            "body": "Please review this.",
-            "body_state": "hydrated",
-        }
-    ]
+def test_sidecar_event_round_trips_exactly() -> None:
+    event = HeyEvent.from_dict(event_dict())
 
-
-def test_watch_event_uses_active_entry_as_authoritative_sender_and_identity() -> None:
-    event = event_from_watch(sample_watch_event(), sample_thread(), own_email="agent@example.com")
-
-    assert event is not None
-    assert event == HeyEvent(
-        event_id="thread:456:entry:900",
-        posting_id=123,
-        thread_id=456,
-        entry_id=900,
-        account_id=12345,
-        sender_id=77,
-        sender_name="Christopher",
-        sender_email="authorized@example.com",
-        subject="Please review",
-        content="Please review this.",
-        app_url="https://app.hey.com/topics/456",
-        created_at="2026-08-25T16:09:59Z",
-        box_kind="imbox",
-    )
+    assert event.identity == "thread:456:entry:900"
     assert event.context_id == "thread:456"
+    assert event.sender_email == "sender@example.com"
     assert event.timestamp == datetime(2026, 8, 25, 16, 9, 59, tzinfo=UTC)
+    assert event.to_dict() == event_dict()
+    assert HeyEvent.from_dict(event.to_dict()) == event
 
 
-def test_same_thread_burst_uses_visible_entry_count_not_timestamps() -> None:
-    raw = sample_watch_event()
-    raw["posting"]["active_at"] = "2026-08-25T16:54:11Z"
-    entries = sample_thread()
-    entries[0]["created_at"] = "2026-08-25T16:53"
-    entries.append(
-        {
-            "id": 901,
-            "created_at": "2026-08-25T16:53",
-            "creator": {
-                "id": 88,
-                "name": "Second sender",
-                "email_address": "second@example.com",
-            },
-            "body": "Second message.",
-            "body_state": "hydrated",
-        }
-    )
+@pytest.mark.parametrize("mutation", ["extra", "missing"])
+def test_sidecar_event_requires_exact_payload_keys(mutation: str) -> None:
+    value = event_dict()
+    if mutation == "extra":
+        value["unexpected"] = "value"
+    else:
+        del value["subject"]
 
-    event = event_from_watch(raw, entries, own_email="agent@example.com")
-
-    assert event is not None
-    assert event.entry_id == 900
-    assert event.content == "Please review this."
-
-    raw["posting"]["visible_entry_count"] = 2
-    second = event_from_watch(raw, entries, own_email="agent@example.com")
-    assert second is not None
-    assert second.entry_id == 901
+    with pytest.raises(ValueError, match="exact keys"):
+        HeyEvent.from_dict(value)
 
 
-def test_missing_or_out_of_range_visible_entry_count_fails_closed() -> None:
-    raw = sample_watch_event()
-    del raw["posting"]["visible_entry_count"]
-    assert event_from_watch(raw, sample_thread(), own_email="agent@example.com") is None
+def test_sidecar_event_identity_must_match_thread_and_entry() -> None:
+    value = event_dict()
+    value["event_id"] = "thread:999:entry:900"
 
-    raw["posting"]["visible_entry_count"] = 2
-    assert event_from_watch(raw, sample_thread(), own_email="agent@example.com") is None
-
-
-@pytest.mark.parametrize("value", [1.0, 1.9, True, False, "1", None])
-def test_non_integer_visible_entry_count_fails_closed(value: object) -> None:
-    raw = sample_watch_event()
-    raw["posting"]["visible_entry_count"] = value
-    assert event_from_watch(raw, sample_thread(), own_email="agent@example.com") is None
+    with pytest.raises(ValueError, match="identity does not match"):
+        HeyEvent.from_dict(value)
 
 
-def test_non_new_watch_event_is_ignored() -> None:
-    raw = sample_watch_event()
-    raw["new"] = False
-    assert event_from_watch(raw, sample_thread(), own_email="agent@example.com") is None
+def test_sidecar_event_app_url_must_match_thread_context() -> None:
+    value = event_dict()
+    value["app_url"] = "https://app.hey.com/topics/999"
+
+    with pytest.raises(ValueError, match="app_url does not match"):
+        HeyEvent.from_dict(value)
 
 
-def test_own_latest_entry_is_ignored_even_when_watch_marks_it_new() -> None:
-    entries = sample_thread()
-    entries[-1]["creator"]["email_address"] = "AGENT@EXAMPLE.COM"
-    assert event_from_watch(sample_watch_event(), entries, own_email="agent@example.com") is None
+@pytest.mark.parametrize("sender_id", [None, True, "77", 77.0, 0, -1])
+def test_sidecar_event_sender_id_must_be_an_exact_positive_integer(sender_id: object) -> None:
+    value = event_dict()
+    value["sender_id"] = sender_id
+
+    with pytest.raises(ValueError, match="sender_id must be a positive integer"):
+        HeyEvent.from_dict(value)
 
 
-def test_partial_or_missing_latest_body_fails_closed() -> None:
-    entries = sample_thread()
-    entries[-1]["body_state"] = "over_limit"
-    assert event_from_watch(sample_watch_event(), entries, own_email="agent@example.com") is None
-    assert event_from_watch(sample_watch_event(), [], own_email="agent@example.com") is None
+@pytest.mark.parametrize(
+    "field",
+    [
+        "event_id",
+        "sender_name",
+        "sender_email",
+        "subject",
+        "content",
+        "app_url",
+        "created_at",
+        "box_kind",
+    ],
+)
+def test_sidecar_event_string_fields_do_not_coerce(field: str) -> None:
+    value = event_dict()
+    value[field] = 123
+
+    with pytest.raises(TypeError, match=f"{field} must be a string"):
+        HeyEvent.from_dict(value)
+
+
+def test_ready_frame_is_exact() -> None:
+    parse_ready_frame({"type": "ready", "protocol_version": 1}, 1)
+
+    with pytest.raises(ValueError, match="exact ready frame"):
+        parse_ready_frame(
+            {"type": "ready", "protocol_version": 1, "unexpected": True}, 1
+        )
 
 
 def test_invalid_context_is_rejected() -> None:
     assert parse_context_id("thread:456") == 456
     with pytest.raises(ValueError):
         parse_context_id("mail:456")
+
+
+@pytest.mark.parametrize("context_id", ["thread:0", "thread:01", "thread:١"])
+def test_context_id_must_use_canonical_positive_ascii_digits(context_id: str) -> None:
+    with pytest.raises(ValueError, match="Invalid HEY context ID"):
+        parse_context_id(context_id)

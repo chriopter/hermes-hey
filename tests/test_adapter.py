@@ -21,29 +21,32 @@ class Config:
     }
 
 
-class FakeCLI:
+class FakeSDKClient:
     def __init__(self, event: HeyEvent | None):
         self.event = event
         self.replies: list[tuple[int, str]] = []
         self.fail_reply = False
         self.identity_matches = True
 
-    def verify_identity(self):
+    def verify(self):
         if not self.identity_matches:
             raise RuntimeError("HEY authenticated identity does not match configuration")
         return True
 
-    def verify_version(self):
-        return True
-
-    def hydrate_event(self, raw):
-        return self.event
-
     def reply(self, thread_id: int, text: str):
         self.replies.append((thread_id, text))
         if self.fail_reply:
-            raise RuntimeError("hey reply failed (exit 6)")
-        return {"ok": True, "data": {"id": 991}}
+            raise RuntimeError("HEY SDK reply failed (exit 75)")
+        return {"ok": True}
+
+
+class AckWatch:
+    def __init__(self):
+        self.acks: list[str] = []
+
+    async def ack(self, identity: str) -> None:
+        self.acks.append(identity)
+
 
 
 def event(
@@ -70,20 +73,57 @@ def event(
     )
 
 
-def adapter(tmp_path: Path, cli: FakeCLI) -> HeyAdapter:
+def adapter(tmp_path: Path, cli: FakeSDKClient) -> HeyAdapter:
     return HeyAdapter(
         Config(),
-        cli=cli,
+        client=cli,
         state_path=tmp_path / "state.json",
         platform=Platform.EMAIL,
     )
 
 
 @pytest.mark.asyncio
+async def test_connect_refuses_pending_event_from_different_account_without_deleting_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dataclasses import replace
+
+    from gateway import status
+
+    state_path = tmp_path / "state.json"
+    seed = adapter(tmp_path, FakeSDKClient(event()))
+    wrong_account = replace(event(), account_id=99999)
+    seed.queue.ingest(wrong_account, lambda _event: True)
+    cli = FakeSDKClient(event())
+    instance = HeyAdapter(
+        Config(), client=cli, state_path=state_path, platform=Platform.EMAIL
+    )
+    handled: list[MessageEvent] = []
+
+    async def capture(event: MessageEvent):
+        handled.append(event)
+
+    async def idle_watch_supervisor():
+        return None
+
+    instance.handle_message = capture
+    instance._watch_supervisor = idle_watch_supervisor
+    monkeypatch.setattr(status, "acquire_scoped_lock", lambda *_args: True)
+    monkeypatch.setattr(status, "release_scoped_lock", lambda *_args: None)
+
+    assert await instance.connect() is False
+    assert handled == []
+    assert cli.replies == []
+    assert [item.to_dict() for item in instance.queue.pending()] == [
+        wrong_account.to_dict()
+    ]
+
+
+@pytest.mark.asyncio
 async def test_disconnected_old_adapter_does_not_chain_before_replacement_exists(
     tmp_path: Path,
 ) -> None:
-    old_cli = FakeCLI(event())
+    old_cli = FakeSDKClient(event())
     old = adapter(tmp_path, old_cli)
     first = event(entry_id=900)
     second = event(entry_id=901)
@@ -118,7 +158,7 @@ async def test_disconnected_old_adapter_does_not_chain_before_replacement_exists
 
 
 def test_email_platform_disables_progressive_message_editing(tmp_path: Path) -> None:
-    instance = adapter(tmp_path, FakeCLI(event()))
+    instance = adapter(tmp_path, FakeSDKClient(event()))
     assert instance.SUPPORTS_MESSAGE_EDITING is False
 
 
@@ -128,7 +168,7 @@ async def test_connect_fails_closed_when_cli_identity_mismatches(tmp_path: Path,
 
     monkeypatch.setattr(status, "acquire_scoped_lock", lambda *_args: True)
     monkeypatch.setattr(status, "release_scoped_lock", lambda *_args: None)
-    cli = FakeCLI(event())
+    cli = FakeSDKClient(event())
     cli.identity_matches = False
     instance = adapter(tmp_path, cli)
 
@@ -137,16 +177,175 @@ async def test_connect_fails_closed_when_cli_identity_mismatches(tmp_path: Path,
 
 
 @pytest.mark.asyncio
-async def test_ready_watch_handshake_resets_consecutive_failure_budget(
+async def test_verified_ready_reschedules_durable_pending_work(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hey_platform.adapter as adapter_module
+
+    class ReadyThenFatalWatch(AckWatch):
+        def __init__(self, **_kwargs):
+            super().__init__()
+
+        async def stop(self):
+            return None
+
+        async def lines(self):
+            yield {"type": "ready", "protocol_version": 1}
+            yield {"type": "fatal"}
+
+    drains = 0
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    instance.failure_threshold = 1
+
+    async def capture_drain() -> None:
+        nonlocal drains
+        drains += 1
+
+    async def ignore_fatal() -> None:
+        return None
+
+    instance._drain_pending = capture_drain
+    instance._notify_fatal_error = ignore_fatal
+    monkeypatch.setattr(adapter_module, "HeySDKWatch", ReadyThenFatalWatch)
+
+    await instance._watch_supervisor()
+
+    assert drains == 1
+
+
+@pytest.mark.asyncio
+async def test_watch_rejects_boolean_ready_protocol_without_draining(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hey_platform.adapter as adapter_module
+
+    class BooleanProtocolWatch(AckWatch):
+        def __init__(self, **_kwargs):
+            super().__init__()
+
+        async def stop(self):
+            return None
+
+        async def lines(self):
+            yield {"type": "ready", "protocol_version": True}
+            yield {"type": "fatal"}
+
+    drains = 0
+    fatal_notified = False
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    instance.failure_threshold = 1
+
+    async def capture_drain() -> None:
+        nonlocal drains
+        drains += 1
+
+    async def capture_fatal() -> None:
+        nonlocal fatal_notified
+        fatal_notified = True
+
+    instance._drain_pending = capture_drain
+    instance._notify_fatal_error = capture_fatal
+    monkeypatch.setattr(adapter_module, "HeySDKWatch", BooleanProtocolWatch)
+
+    await instance._watch_supervisor()
+
+    assert fatal_notified is True
+    assert drains == 0
+
+
+@pytest.mark.asyncio
+async def test_watch_rejects_event_before_ready_without_persistence_or_ack(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hey_platform.adapter as adapter_module
+
+    class EventBeforeReadyWatch(AckWatch):
+        last: ClassVar[EventBeforeReadyWatch | None] = None
+
+        def __init__(self, **_kwargs):
+            super().__init__()
+            EventBeforeReadyWatch.last = self
+
+        async def stop(self):
+            return None
+
+        async def lines(self):
+            yield {"type": "event", "event": event().to_dict()}
+
+    fatal_notified = False
+
+    async def capture_fatal():
+        nonlocal fatal_notified
+        fatal_notified = True
+
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    instance.failure_threshold = 1
+    instance._notify_fatal_error = capture_fatal
+    monkeypatch.setattr(adapter_module, "HeySDKWatch", EventBeforeReadyWatch)
+
+    await instance._watch_supervisor()
+
+    assert fatal_notified is True
+    assert not (tmp_path / "state.json").exists()
+    assert EventBeforeReadyWatch.last is not None
+    assert EventBeforeReadyWatch.last.acks == []
+
+
+@pytest.mark.asyncio
+async def test_watch_rejects_duplicate_ready_without_persistence_or_ack(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hey_platform.adapter as adapter_module
+
+    class DuplicateReadyWatch(AckWatch):
+        last: ClassVar[DuplicateReadyWatch | None] = None
+
+        def __init__(self, **_kwargs):
+            super().__init__()
+            DuplicateReadyWatch.last = self
+
+        async def stop(self):
+            return None
+
+        async def lines(self):
+            yield {"type": "ready", "protocol_version": 1}
+            yield {"type": "ready", "protocol_version": 1}
+            yield {"type": "event", "event": event().to_dict()}
+
+    fatal_notified = False
+
+    async def capture_fatal():
+        nonlocal fatal_notified
+        fatal_notified = True
+
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    instance.failure_threshold = 1
+    instance._notify_fatal_error = capture_fatal
+    monkeypatch.setattr(adapter_module, "HeySDKWatch", DuplicateReadyWatch)
+
+    await instance._watch_supervisor()
+
+    assert fatal_notified is True
+    assert not (tmp_path / "state.json").exists()
+    assert DuplicateReadyWatch.last is not None
+    assert DuplicateReadyWatch.last.acks == []
+
+
+@pytest.mark.asyncio
+async def test_ready_then_failure_still_reaches_consecutive_failure_threshold(
     tmp_path: Path, monkeypatch
 ) -> None:
     import hey_platform.adapter as adapter_module
 
     class SequenceWatch:
         calls = 0
+        stops = 0
 
         def __init__(self, **_kwargs):
             pass
+
+        async def stop(self):
+            SequenceWatch.stops += 1
 
         async def lines(self):
             SequenceWatch.calls += 1
@@ -155,7 +354,7 @@ async def test_ready_watch_handshake_resets_consecutive_failure_budget(
                     yield {}
                 raise RuntimeError("first disconnect")
             if SequenceWatch.calls == 2:
-                yield {"change": "ready"}
+                yield {"type": "ready", "protocol_version": 1}
                 raise RuntimeError("later disconnect")
             raise asyncio.CancelledError
             yield {}
@@ -169,22 +368,70 @@ async def test_ready_watch_handshake_resets_consecutive_failure_budget(
         nonlocal fatal_notified
         fatal_notified = True
 
-    instance = adapter(tmp_path, FakeCLI(event()))
+    instance = adapter(tmp_path, FakeSDKClient(event()))
     instance.failure_threshold = 2
     instance._notify_fatal_error = capture_fatal
-    monkeypatch.setattr(adapter_module, "HeyWatch", SequenceWatch)
+    monkeypatch.setattr(adapter_module, "HeySDKWatch", SequenceWatch)
     monkeypatch.setattr(adapter_module.asyncio, "sleep", no_sleep)
 
-    with pytest.raises(asyncio.CancelledError):
-        await instance._watch_supervisor()
+    await instance._watch_supervisor()
 
-    assert fatal_notified is False
+    assert fatal_notified is True
+    assert SequenceWatch.calls == 2
+    assert SequenceWatch.stops == 2
+
+
+@pytest.mark.asyncio
+async def test_stable_watch_runtime_resets_prior_failure_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hey_platform.adapter as adapter_module
+
+    class SequenceWatch:
+        calls = 0
+        stops = 0
+
+        def __init__(self, **_kwargs):
+            pass
+
+        async def stop(self):
+            SequenceWatch.stops += 1
+
+        async def lines(self):
+            SequenceWatch.calls += 1
+            if SequenceWatch.calls == 2:
+                yield {"type": "ready", "protocol_version": 1}
+            raise RuntimeError("disconnect")
+            yield {}
+
+    moments = iter([0.0, 1.0, 10.0, 41.0, 42.0, 43.0])
+
+    async def no_sleep(_seconds):
+        return None
+
+    fatal_notified = False
+
+    async def capture_fatal():
+        nonlocal fatal_notified
+        fatal_notified = True
+
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    instance.failure_threshold = 2
+    instance._notify_fatal_error = capture_fatal
+    monkeypatch.setattr(adapter_module, "HeySDKWatch", SequenceWatch)
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(adapter_module, "monotonic", lambda: next(moments), raising=False)
+
+    await instance._watch_supervisor()
+
+    assert fatal_notified is True
     assert SequenceWatch.calls == 3
+    assert SequenceWatch.stops == 3
 
 
 @pytest.mark.asyncio
 async def test_drain_dispatches_only_one_pending_event_per_thread(tmp_path: Path) -> None:
-    instance = adapter(tmp_path, FakeCLI(event()))
+    instance = adapter(tmp_path, FakeSDKClient(event()))
     first = event(entry_id=900)
     second = event(entry_id=901)
     instance.queue.ingest(first, lambda _event: True)
@@ -202,7 +449,7 @@ async def test_drain_dispatches_only_one_pending_event_per_thread(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_completed_event_releases_thread_and_dispatches_next(tmp_path: Path) -> None:
-    instance = adapter(tmp_path, FakeCLI(event()))
+    instance = adapter(tmp_path, FakeSDKClient(event()))
     first = event(entry_id=900)
     second = event(entry_id=901)
     instance.queue.ingest(first, lambda _event: True)
@@ -225,8 +472,8 @@ async def test_completed_event_releases_thread_and_dispatches_next(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_replacement_adapter_does_not_redrain_claimed_event(tmp_path: Path) -> None:
-    first_adapter = adapter(tmp_path, FakeCLI(event()))
-    replacement = adapter(tmp_path, FakeCLI(event()))
+    first_adapter = adapter(tmp_path, FakeSDKClient(event()))
+    replacement = adapter(tmp_path, FakeSDKClient(event()))
     first_adapter.queue.ingest(event(), lambda _event: True)
     first_handled: list[MessageEvent] = []
     replacement_handled: list[MessageEvent] = []
@@ -248,8 +495,8 @@ async def test_replacement_adapter_does_not_redrain_claimed_event(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_failed_old_adapter_hands_pending_retry_to_live_replacement(tmp_path: Path) -> None:
-    old = adapter(tmp_path, FakeCLI(event()))
-    replacement = adapter(tmp_path, FakeCLI(event()))
+    old = adapter(tmp_path, FakeSDKClient(event()))
+    replacement = adapter(tmp_path, FakeSDKClient(event()))
     pending = event()
     old.queue.ingest(pending, lambda _event: True)
     assert old._claim(pending) is True
@@ -278,8 +525,8 @@ async def test_failed_old_adapter_hands_pending_retry_to_live_replacement(tmp_pa
 
 @pytest.mark.asyncio
 async def test_successful_old_adapter_hands_followup_drain_to_live_replacement(tmp_path: Path) -> None:
-    old = adapter(tmp_path, FakeCLI(event()))
-    replacement = adapter(tmp_path, FakeCLI(event()))
+    old = adapter(tmp_path, FakeSDKClient(event()))
+    replacement = adapter(tmp_path, FakeSDKClient(event()))
     first = event(entry_id=900)
     second = event(entry_id=901)
     old.queue.ingest(first, lambda _event: True)
@@ -319,8 +566,8 @@ async def test_successful_old_adapter_hands_followup_drain_to_live_replacement(t
 async def test_real_background_lifecycle_hands_successful_chain_to_replacement(
     tmp_path: Path,
 ) -> None:
-    old_cli = FakeCLI(event())
-    replacement_cli = FakeCLI(event())
+    old_cli = FakeSDKClient(event())
+    replacement_cli = FakeSDKClient(event())
     old = adapter(tmp_path, old_cli)
     replacement = adapter(tmp_path, replacement_cli)
     first = event(entry_id=900)
@@ -376,8 +623,8 @@ async def test_real_background_lifecycle_hands_successful_chain_to_replacement(
 
 @pytest.mark.asyncio
 async def test_real_background_failure_retries_on_replacement(tmp_path: Path) -> None:
-    old_cli = FakeCLI(event())
-    replacement_cli = FakeCLI(event())
+    old_cli = FakeSDKClient(event())
+    replacement_cli = FakeSDKClient(event())
     old = adapter(tmp_path, old_cli)
     replacement = adapter(tmp_path, replacement_cli)
     pending = event()
@@ -417,8 +664,8 @@ async def test_real_background_failure_retries_on_replacement(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_real_background_cancellation_retries_on_replacement(tmp_path: Path) -> None:
-    old_cli = FakeCLI(event())
-    replacement_cli = FakeCLI(event())
+    old_cli = FakeSDKClient(event())
+    replacement_cli = FakeSDKClient(event())
     old = adapter(tmp_path, old_cli)
     replacement = adapter(tmp_path, replacement_cli)
     pending = event()
@@ -458,44 +705,126 @@ async def test_real_background_cancellation_retries_on_replacement(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_posting_id", [True, 0, -1, "123"])
+async def test_malformed_posting_id_creates_no_queue_state_or_ack(
+    tmp_path: Path, invalid_posting_id
+) -> None:
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    watch = AckWatch()
+    instance._watch = cast(Any, watch)
+    payload = event().to_dict()
+    payload["posting_id"] = invalid_posting_id
+
+    with pytest.raises(RuntimeError, match="invalid event"):
+        await instance.process_watch_line({"type": "event", "event": payload})
+
+    assert not (tmp_path / "state.json").exists()
+    assert watch.acks == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_thread_id", [True, 0, -1, "456"])
+async def test_malformed_thread_id_creates_no_queue_state_or_ack(
+    tmp_path: Path, invalid_thread_id
+) -> None:
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    watch = AckWatch()
+    instance._watch = cast(Any, watch)
+    payload = event().to_dict()
+    payload["thread_id"] = invalid_thread_id
+    payload["event_id"] = f"thread:{int(invalid_thread_id)}:entry:900"
+
+    with pytest.raises(RuntimeError, match="invalid event"):
+        await instance.process_watch_line({"type": "event", "event": payload})
+
+    assert not (tmp_path / "state.json").exists()
+    assert watch.acks == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_entry_id", [True, 0, -1, "900"])
+async def test_malformed_entry_id_creates_no_queue_state_or_ack(
+    tmp_path: Path, invalid_entry_id
+) -> None:
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    watch = AckWatch()
+    instance._watch = cast(Any, watch)
+    payload = event().to_dict()
+    payload["entry_id"] = invalid_entry_id
+    payload["event_id"] = f"thread:456:entry:{int(invalid_entry_id)}"
+
+    with pytest.raises(RuntimeError, match="invalid event"):
+        await instance.process_watch_line({"type": "event", "event": payload})
+
+    assert not (tmp_path / "state.json").exists()
+    assert watch.acks == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_account_id", [True, 0, -1, "12345"])
+async def test_malformed_account_id_creates_no_queue_state_or_ack(
+    tmp_path: Path, invalid_account_id
+) -> None:
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    watch = AckWatch()
+    instance._watch = cast(Any, watch)
+    payload = event().to_dict()
+    payload["account_id"] = invalid_account_id
+
+    with pytest.raises(RuntimeError, match="invalid event"):
+        await instance.process_watch_line({"type": "event", "event": payload})
+
+    assert not (tmp_path / "state.json").exists()
+    assert watch.acks == []
+
+
+@pytest.mark.asyncio
 async def test_authorized_email_routes_one_session_per_thread_and_stays_pending(tmp_path: Path) -> None:
-    instance = adapter(tmp_path, FakeCLI(event()))
+    instance = adapter(tmp_path, FakeSDKClient(event()))
     handled = []
 
     async def capture(event: MessageEvent):
         handled.append(event)
 
     instance.handle_message = capture
-    await instance.process_watch_line({"change": "added"})
+    watch = AckWatch()
+    instance._watch = cast(Any, watch)
+    await instance.process_watch_line({"type": "event", "event": event().to_dict()})
 
     assert len(handled) == 1
     message = handled[0]
     assert message.source.chat_id == "thread:456"
     assert message.source.user_id == "authorized@example.com"
     assert message.text.startswith("HEY email: Request")
+    assert watch.acks == [event().identity]
     assert [item.identity for item in instance.queue.pending()] == [event().identity]
 
 
 @pytest.mark.asyncio
 async def test_unauthorized_email_is_not_persisted_or_dispatched(tmp_path: Path) -> None:
     outsider = event(sender="outsider@example.com", content="private outsider content")
-    instance = adapter(tmp_path, FakeCLI(outsider))
+    instance = adapter(tmp_path, FakeSDKClient(outsider))
     handled = []
 
     async def capture(event: MessageEvent):
         handled.append(event)
 
     instance.handle_message = capture
-    await instance.process_watch_line({"change": "added"})
+    watch = AckWatch()
+    instance._watch = cast(Any, watch)
+    await instance.process_watch_line(
+        {"type": "event", "event": outsider.to_dict()}
+    )
 
     assert handled == []
+    assert watch.acks == [outsider.identity]
     assert instance.queue.pending() == []
     assert not (tmp_path / "state.json").exists()
 
 
 @pytest.mark.asyncio
 async def test_direct_send_never_completes_pending_event(tmp_path: Path) -> None:
-    cli = FakeCLI(event())
+    cli = FakeSDKClient(event())
     instance = adapter(tmp_path, cli)
     instance.queue.ingest(event(), lambda _event: True)
     instance._delivery_context.set(("thread:456", [event().identity]))
@@ -509,7 +838,7 @@ async def test_direct_send_never_completes_pending_event(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_confirmed_final_retry_path_completes_exact_pending_event(tmp_path: Path) -> None:
-    cli = FakeCLI(event())
+    cli = FakeSDKClient(event())
     instance = adapter(tmp_path, cli)
     instance.queue.ingest(event(), lambda _event: True)
     assert instance._claim(event()) is True
@@ -523,7 +852,7 @@ async def test_confirmed_final_retry_path_completes_exact_pending_event(tmp_path
 
 @pytest.mark.asyncio
 async def test_failed_reply_keeps_pending_event(tmp_path: Path) -> None:
-    cli = FakeCLI(event())
+    cli = FakeSDKClient(event())
     cli.fail_reply = True
     instance = adapter(tmp_path, cli)
     instance.queue.ingest(event(), lambda _event: True)
@@ -532,13 +861,18 @@ async def test_failed_reply_keeps_pending_event(tmp_path: Path) -> None:
     result = await instance._send_with_retry("thread:456", "Done", base_delay=0)
 
     assert result.success is False
-    assert cli.replies == [(456, "Done"), (456, "Done"), (456, "Done")]
+    assert cli.replies == [
+        (456, "Done"),
+        (456, "Done"),
+        (456, "Done"),
+        (456, "Done"),
+    ]
     assert [item.identity for item in instance.queue.pending()] == [event().identity]
 
 
 @pytest.mark.asyncio
 async def test_media_fallback_cannot_send_a_second_email(tmp_path: Path) -> None:
-    cli = FakeCLI(event())
+    cli = FakeSDKClient(event())
     instance = adapter(tmp_path, cli)
     instance.queue.ingest(event(), lambda _event: True)
     assert instance._claim(event()) is True
@@ -554,8 +888,8 @@ async def test_media_fallback_cannot_send_a_second_email(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_replacement_adapter_can_ack_old_adapters_shared_claim(tmp_path: Path) -> None:
-    old = adapter(tmp_path, FakeCLI(event()))
-    replacement_cli = FakeCLI(event())
+    old = adapter(tmp_path, FakeSDKClient(event()))
+    replacement_cli = FakeSDKClient(event())
     replacement = adapter(tmp_path, replacement_cli)
     old.queue.ingest(event(), lambda _event: True)
     assert old._claim(event()) is True
@@ -569,7 +903,7 @@ async def test_replacement_adapter_can_ack_old_adapters_shared_claim(tmp_path: P
 
 @pytest.mark.asyncio
 async def test_processing_success_without_delivery_does_not_ack_queue(tmp_path: Path) -> None:
-    instance = adapter(tmp_path, FakeCLI(event()))
+    instance = adapter(tmp_path, FakeSDKClient(event()))
     instance.queue.ingest(event(), lambda _event: True)
     instance._inflight.add(event().identity)
     message = cast(

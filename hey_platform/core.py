@@ -6,6 +6,22 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+_EVENT_KEYS = {
+    "event_id",
+    "posting_id",
+    "thread_id",
+    "entry_id",
+    "account_id",
+    "sender_id",
+    "sender_name",
+    "sender_email",
+    "subject",
+    "content",
+    "app_url",
+    "created_at",
+    "box_kind",
+}
+
 
 def strict_bool(value: Any) -> bool:
     if value is True:
@@ -15,14 +31,26 @@ def strict_bool(value: Any) -> bool:
     return False
 
 
+def _positive_int(value: Any, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"HEY {name} must be a positive integer")
+    return value
+
+
+def _string(value: Any, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"HEY {name} must be a string")
+    return value
+
+
 @dataclass(slots=True)
 class HeyEvent:
     event_id: str
     posting_id: int
     thread_id: int
     entry_id: int
-    account_id: int | None
-    sender_id: int | None
+    account_id: int
+    sender_id: int
     sender_name: str
     sender_email: str
     subject: str
@@ -52,81 +80,57 @@ class HeyEvent:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> HeyEvent:
+        if set(value) != _EVENT_KEYS:
+            raise ValueError("HEY event payload must contain exact keys")
+        event_id = _string(value["event_id"], "event_id")
+        thread_id = _positive_int(value["thread_id"], "thread_id")
+        entry_id = _positive_int(value["entry_id"], "entry_id")
+        if event_id != f"thread:{thread_id}:entry:{entry_id}":
+            raise ValueError("HEY event identity does not match thread and entry")
+        app_url = _string(value["app_url"], "app_url")
+        if app_url != f"https://app.hey.com/topics/{thread_id}":
+            raise ValueError("HEY event app_url does not match thread context")
         return cls(
-            event_id=str(value["event_id"]),
-            posting_id=int(value["posting_id"]),
-            thread_id=int(value["thread_id"]),
-            entry_id=int(value["entry_id"]),
-            account_id=int(value["account_id"]) if value.get("account_id") else None,
-            sender_id=int(value["sender_id"]) if value.get("sender_id") else None,
-            sender_name=str(value.get("sender_name") or ""),
-            sender_email=str(value.get("sender_email") or "").lower(),
-            subject=str(value.get("subject") or ""),
-            content=str(value.get("content") or ""),
-            app_url=str(value.get("app_url") or ""),
-            created_at=str(value.get("created_at") or ""),
-            box_kind=str(value.get("box_kind") or ""),
+            event_id=event_id,
+            posting_id=_positive_int(value["posting_id"], "posting_id"),
+            thread_id=thread_id,
+            entry_id=entry_id,
+            account_id=_positive_int(value["account_id"], "account_id"),
+            sender_id=_positive_int(value["sender_id"], "sender_id"),
+            sender_name=_string(value["sender_name"], "sender_name"),
+            sender_email=_string(value["sender_email"], "sender_email"),
+            subject=_string(value["subject"], "subject"),
+            content=_string(value["content"], "content"),
+            app_url=app_url,
+            created_at=_string(value["created_at"], "created_at"),
+            box_kind=_string(value["box_kind"], "box_kind"),
         )
 
 
+def parse_ready_frame(value: dict[str, Any], protocol_version: int) -> None:
+    if set(value) != {"type", "protocol_version"}:
+        raise ValueError("HEY SDK watch must send an exact ready frame")
+    if value["type"] != "ready":
+        raise ValueError("HEY SDK watch must start with ready")
+    actual = value["protocol_version"]
+    if type(actual) is not int or actual != protocol_version:
+        raise ValueError("HEY SDK watch protocol mismatch")
+
+
+def parse_event_frame(value: dict[str, Any]) -> HeyEvent:
+    if set(value) != {"type", "event"} or value.get("type") != "event":
+        raise ValueError("HEY SDK watch returned an invalid post-ready frame")
+    payload = value["event"]
+    if not isinstance(payload, dict):
+        raise TypeError("HEY SDK watch returned an invalid event payload")
+    event = HeyEvent.from_dict(payload)
+    if event.to_dict() != payload:
+        raise ValueError("HEY SDK watch event payload did not round-trip exactly")
+    return event
+
+
 def parse_context_id(value: str) -> int:
-    match = re.fullmatch(r"thread:(\d+)", value or "")
+    match = re.fullmatch(r"thread:([1-9][0-9]*)", value or "")
     if not match:
         raise ValueError(f"Invalid HEY context ID: {value!r}")
     return int(match.group(1))
-
-
-def event_from_watch(
-    raw: dict[str, Any],
-    entries: list[dict[str, Any]],
-    *,
-    own_email: str,
-) -> HeyEvent | None:
-    """Build one authoritative event from a HEY watch line and hydrated thread."""
-    if raw.get("new") is not True or raw.get("change") not in {"added", "updated"}:
-        return None
-    if not entries:
-        return None
-    posting_raw = raw.get("posting")
-    posting: dict[str, Any] = posting_raw if isinstance(posting_raw, dict) else {}
-    visible_entry_count = posting.get("visible_entry_count")
-    if type(visible_entry_count) is not int:
-        return None
-    if visible_entry_count < 1 or visible_entry_count > len(entries):
-        return None
-    active = entries[visible_entry_count - 1]
-    if str(active.get("body_state") or "") not in {"hydrated", "bodyless"}:
-        return None
-    creator_raw = active.get("creator")
-    creator: dict[str, Any] = creator_raw if isinstance(creator_raw, dict) else {}
-    sender_email = str(creator.get("email_address") or "").strip().lower()
-    if not sender_email or sender_email == own_email.strip().lower():
-        return None
-    posting_raw = raw.get("posting")
-    posting: dict[str, Any] = posting_raw if isinstance(posting_raw, dict) else {}
-    box_raw = raw.get("box")
-    box: dict[str, Any] = box_raw if isinstance(box_raw, dict) else {}
-    try:
-        posting_id = int(raw["posting_id"])
-        thread_id = int(raw["thread_id"])
-        entry_id = int(active["id"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    body = str(active.get("body") or active.get("summary") or "").strip()
-    if not body:
-        return None
-    return HeyEvent(
-        event_id=f"thread:{thread_id}:entry:{entry_id}",
-        posting_id=posting_id,
-        thread_id=thread_id,
-        entry_id=entry_id,
-        account_id=int(posting["account_id"]) if posting.get("account_id") else None,
-        sender_id=int(creator["id"]) if creator.get("id") else None,
-        sender_name=str(creator.get("name") or ""),
-        sender_email=sender_email,
-        subject=str(posting.get("name") or active.get("summary") or ""),
-        content=body,
-        app_url=f"https://app.hey.com/topics/{thread_id}",
-        created_at=str(active.get("created_at") or raw.get("at") or ""),
-        box_kind=str(box.get("kind") or ""),
-    )
