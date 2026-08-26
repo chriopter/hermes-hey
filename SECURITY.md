@@ -2,7 +2,7 @@
 
 ## Trust boundary
 
-HEY senders, subjects, bodies, links, attachment URLs, and metadata are untrusted input. They enter Hermes with `allow_gateway_control=False`; remote text is never interpreted as gateway configuration or control instructions.
+HEY senders, comment authors, subjects, message bodies, Collab comment content, links, attachment URLs, and metadata are untrusted input. They enter Hermes with `allow_gateway_control=False`; remote text is never interpreted as gateway configuration or control instructions.
 
 The Go sidecar is a local trusted component, but Python validates frame shape, protocol version, exact event identity, and account binding before persistence or acknowledgement.
 
@@ -21,16 +21,16 @@ Credential directories must be mode `0700` and files mode `0600` on POSIX. Each 
 ## Process boundary
 
 - Sidecar executable, account, paths, and IDs are separate argv elements; no shell is used.
-- Reply content travels as bounded JSON over stdin.
+- Email-reply and Collab-comment content travels as bounded JSON over stdin.
 - Environment propagation is allowlisted and excludes unrelated service-account secrets.
 - stdout/NDJSON is size-bounded and schema-checked.
 - stderr and remote response bodies are discarded or reduced to redacted operation errors.
 - Cursor files are atomic, owner-only, and contain no email content.
-- Reply mutations are not automatically repeated after ambiguous network outcomes.
+- Email-reply and Collab-comment mutations are not automatically repeated after ambiguous network outcomes.
 
 ## Data handling
 
-Only authorized events enter the Hermes durable queue. Queue state contains exact event IDs and the compact message data required for restart recovery. It remains until HEY confirms the final reply. No OAuth token, password, TOTP value, recovery code, or credential-store content belongs in queue state or this repository.
+Only authorized events enter the Hermes durable queue. Queue state contains exact event IDs, the typed entry kind, and the compact message or comment data required for restart recovery. It remains until HEY confirms the matching final email reply or Collab comment. No OAuth token, password, TOTP value, recovery code, or credential-store content belongs in queue state or this repository.
 
 All public fixtures use reserved example domains and synthetic IDs. Do not commit real account, sender, thread, customer, subject, message, attachment, or production-event data.
 

@@ -52,7 +52,7 @@ def test_windows_job_source_contract_is_cross_platform_importable() -> None:
     assert "0x00002000" in source
 
 
-def test_sdk_client_uses_protocol_verify_and_reply_without_argument_content() -> None:
+def test_sdk_client_uses_protocol_mutations_without_argument_content() -> None:
     calls: list[tuple[list[str], dict | None]] = []
 
     def runner(args: list[str], payload: dict | None = None) -> dict:
@@ -60,7 +60,7 @@ def test_sdk_client_uses_protocol_verify_and_reply_without_argument_content() ->
         if args[0] == "verify":
             return {
                 "ok": True,
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "sdk_version": "0.24.0",
                 "account": 12345,
                 "email": "agent@example.com",
@@ -75,11 +75,29 @@ def test_sdk_client_uses_protocol_verify_and_reply_without_argument_content() ->
 
     assert client.verify() is True
     assert client.reply(456, "private reply") == {"ok": True}
+    assert client.comment(456, "internal response") == {"ok": True}
     assert calls == [
         (["verify", "--own-email", "agent@example.com"], None),
         (["reply", "--thread-id", "456"], {"content": "private reply"}),
+        (["comment", "--thread-id", "456"], {"content": "internal response"}),
     ]
     assert "private reply" not in calls[1][0]
+    assert "internal response" not in calls[2][0]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [{}, {"ok": False}, {"ok": 1}, {"ok": True, "extra": None}],
+)
+def test_sdk_client_comment_rejects_non_exact_response_schema(result: dict) -> None:
+    client = HeySDKClient(
+        lambda _args, _payload: result,
+        account="12345",
+        own_email="agent@example.com",
+    )
+
+    with pytest.raises(RuntimeError, match="HEY SDK comment failed"):
+        client.comment(456, "internal response")
 
 
 def test_sdk_client_rejects_boolean_protocol_version() -> None:
@@ -161,23 +179,23 @@ def test_sdk_client_rejects_noncanonical_configured_account(account: object) -> 
 @pytest.mark.parametrize(
     "result",
     [
-        {"protocol_version": 1, "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com"},
+        {"protocol_version": 2, "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com"},
         {"ok": True, "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "account": 12345, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": "0.24.0", "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": "0.24.0", "account": 12345},
-        {"ok": True, "protocol_version": 1, "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com", "extra": None},
-        {"ok": 1, "protocol_version": 1, "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": "1", "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 2, "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": 0.24, "account": 12345, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": "v0.24.0", "account": 12345, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": "0.24", "account": 12345, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": "0.24.0", "account": "12345", "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": "0.24.0", "account": True, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": "0.24.0", "account": 54321, "email": "agent@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": "0.24.0", "account": 12345, "email": "AGENT@example.com"},
-        {"ok": True, "protocol_version": 1, "sdk_version": "0.24.0", "account": 12345, "email": "other@example.com"},
+        {"ok": True, "protocol_version": 2, "account": 12345, "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": "0.24.0", "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": "0.24.0", "account": 12345},
+        {"ok": True, "protocol_version": 2, "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com", "extra": None},
+        {"ok": 1, "protocol_version": 2, "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com"},
+        {"ok": True, "protocol_version": "2", "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 1, "sdk_version": "0.24.0", "account": 12345, "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": 0.24, "account": 12345, "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": "v0.24.0", "account": 12345, "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": "0.24", "account": 12345, "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": "0.24.0", "account": "12345", "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": "0.24.0", "account": True, "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": "0.24.0", "account": 54321, "email": "agent@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": "0.24.0", "account": 12345, "email": "AGENT@example.com"},
+        {"ok": True, "protocol_version": 2, "sdk_version": "0.24.0", "account": 12345, "email": "other@example.com"},
     ],
     ids=[
         "missing-ok",

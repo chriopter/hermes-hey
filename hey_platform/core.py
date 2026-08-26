@@ -8,6 +8,7 @@ from typing import Any
 
 _EVENT_KEYS = {
     "event_id",
+    "kind",
     "posting_id",
     "thread_id",
     "entry_id",
@@ -46,6 +47,7 @@ def _string(value: Any, name: str) -> str:
 @dataclass(slots=True)
 class HeyEvent:
     event_id: str
+    kind: str
     posting_id: int
     thread_id: int
     entry_id: int
@@ -83,6 +85,9 @@ class HeyEvent:
         if set(value) != _EVENT_KEYS:
             raise ValueError("HEY event payload must contain exact keys")
         event_id = _string(value["event_id"], "event_id")
+        kind = _string(value["kind"], "kind")
+        if kind not in {"message", "comment"}:
+            raise ValueError("HEY kind must be message or comment")
         thread_id = _positive_int(value["thread_id"], "thread_id")
         entry_id = _positive_int(value["entry_id"], "entry_id")
         if event_id != f"thread:{thread_id}:entry:{entry_id}":
@@ -92,6 +97,7 @@ class HeyEvent:
             raise ValueError("HEY event app_url does not match thread context")
         return cls(
             event_id=event_id,
+            kind=kind,
             posting_id=_positive_int(value["posting_id"], "posting_id"),
             thread_id=thread_id,
             entry_id=entry_id,

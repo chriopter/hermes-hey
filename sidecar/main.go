@@ -18,6 +18,7 @@ type hydrationAPI interface {
 
 type event struct {
 	EventID     string `json:"event_id"`
+	Kind        string `json:"kind"`
 	PostingID   int64  `json:"posting_id"`
 	ThreadID    int64  `json:"thread_id"`
 	EntryID     int64  `json:"entry_id"`
@@ -32,13 +33,12 @@ type event struct {
 	BoxKind     string `json:"box_kind"`
 }
 
-func visibleMessageEntry(entriesNewestFirst []generated.Entry, visibleCount int) *generated.Entry {
+func visibleEventEntry(entriesNewestFirst []generated.Entry, visibleCount int) *generated.Entry {
 	if visibleCount < 1 || visibleCount > len(entriesNewestFirst) {
 		return nil
 	}
-	index := len(entriesNewestFirst) - visibleCount
-	entry := &entriesNewestFirst[index]
-	if entry.Kind != "message" {
+	entry := &entriesNewestFirst[len(entriesNewestFirst)-visibleCount]
+	if entry.Kind != "message" && entry.Kind != "comment" {
 		return nil
 	}
 	return entry
@@ -69,18 +69,12 @@ func hydratePosting(ctx context.Context, api hydrationAPI, posting generated.Pos
 	if err != nil {
 		return nil, err
 	}
-	entry := visibleMessageEntry(entries, int(posting.VisibleEntryCount))
+	entry := visibleEventEntry(entries, int(posting.VisibleEntryCount))
 	if entry == nil {
 		return nil, nil
 	}
-	message, err := api.Message(ctx, entry.Id)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateHydratedMessage(entry.Id, message); err != nil {
-		return nil, err
-	}
-	return eventFromMessage(posting, threadID, entry.Id, message, boxKind), nil
+	event, _, err := hydrateEntry(ctx, api, posting, threadID, *entry, boxKind)
+	return event, err
 }
 
 func hydratePostingSince(ctx context.Context, api hydrationAPI, posting generated.Posting, boxKind string, since time.Time) ([]*event, error) {
@@ -92,28 +86,25 @@ func hydratePostingSince(ctx context.Context, api hydrationAPI, posting generate
 	if err != nil {
 		return nil, err
 	}
-	active := visibleMessageEntry(entries, int(posting.VisibleEntryCount))
+	active := visibleEventEntry(entries, int(posting.VisibleEntryCount))
 	var activeID int64
 	if active != nil {
 		activeID = active.Id
 	}
 	events := make([]*event, 0)
 	for _, entry := range entries {
-		if entry.Kind != "message" {
+		if entry.Kind != "message" && entry.Kind != "comment" {
 			continue
 		}
-		message, err := api.Message(ctx, entry.Id)
+		event, createdAt, err := hydrateEntry(ctx, api, posting, threadID, entry, boxKind)
 		if err != nil {
 			return nil, err
 		}
-		if err := validateHydratedMessage(entry.Id, message); err != nil {
-			return nil, err
-		}
-		isNew := message.CreatedAt.After(since)
+		isNew := createdAt.After(since)
 		if !isNew && entry.Id != activeID {
 			break
 		}
-		events = append(events, eventFromMessage(posting, threadID, entry.Id, message, boxKind))
+		events = append(events, event)
 		if !isNew {
 			break
 		}
@@ -122,6 +113,34 @@ func hydratePostingSince(ctx context.Context, api hydrationAPI, posting generate
 		events[left], events[right] = events[right], events[left]
 	}
 	return events, nil
+}
+
+func hydrateEntry(ctx context.Context, api hydrationAPI, posting generated.Posting, threadID int64, entry generated.Entry, boxKind string) (*event, time.Time, error) {
+	switch entry.Kind {
+	case "message":
+		message, err := api.Message(ctx, entry.Id)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		if err := validateHydratedMessage(entry.Id, message); err != nil {
+			return nil, time.Time{}, err
+		}
+		return eventFromMessage(posting, threadID, entry.Id, message, boxKind), message.CreatedAt, nil
+	case "comment":
+		if err := validateCommentEntry(entry); err != nil {
+			return nil, time.Time{}, err
+		}
+		return eventFromComment(posting, threadID, entry, boxKind), entry.CreatedAt, nil
+	default:
+		return nil, time.Time{}, fmt.Errorf("unsupported entry kind")
+	}
+}
+
+func validateCommentEntry(entry generated.Entry) error {
+	if entry.Id <= 0 || entry.CreatedAt.IsZero() || entry.Creator.Id <= 0 || strings.TrimSpace(entry.Creator.EmailAddress) == "" || strings.TrimSpace(entry.Summary) == "" {
+		return fmt.Errorf("comment entry is incomplete")
+	}
+	return nil
 }
 
 func validateHydratedMessage(entryID int64, message *generated.Message) error {
@@ -137,6 +156,7 @@ func validateHydratedMessage(entryID int64, message *generated.Message) error {
 func eventFromMessage(posting generated.Posting, threadID, entryID int64, message *generated.Message, boxKind string) *event {
 	return &event{
 		EventID:     fmt.Sprintf("thread:%d:entry:%d", threadID, entryID),
+		Kind:        "message",
 		PostingID:   posting.Id,
 		ThreadID:    threadID,
 		EntryID:     entryID,
@@ -148,6 +168,25 @@ func eventFromMessage(posting generated.Posting, threadID, entryID int64, messag
 		Content:     message.Content,
 		AppURL:      fmt.Sprintf("https://app.hey.com/topics/%d", threadID),
 		CreatedAt:   message.CreatedAt.Format("2006-01-02T15:04:05.999999999Z07:00"),
+		BoxKind:     boxKind,
+	}
+}
+
+func eventFromComment(posting generated.Posting, threadID int64, entry generated.Entry, boxKind string) *event {
+	return &event{
+		EventID:     fmt.Sprintf("thread:%d:entry:%d", threadID, entry.Id),
+		Kind:        "comment",
+		PostingID:   posting.Id,
+		ThreadID:    threadID,
+		EntryID:     entry.Id,
+		AccountID:   posting.AccountId,
+		SenderID:    entry.Creator.Id,
+		SenderName:  entry.Creator.Name,
+		SenderEmail: strings.ToLower(strings.TrimSpace(entry.Creator.EmailAddress)),
+		Subject:     posting.Name,
+		Content:     entry.Summary,
+		AppURL:      fmt.Sprintf("https://app.hey.com/topics/%d", threadID),
+		CreatedAt:   entry.CreatedAt.Format("2006-01-02T15:04:05.999999999Z07:00"),
 		BoxKind:     boxKind,
 	}
 }

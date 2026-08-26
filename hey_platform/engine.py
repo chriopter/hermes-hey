@@ -38,6 +38,7 @@ _WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544"
 _EVENT_IDENTITY = re.compile(r"thread:[1-9][0-9]*:entry:[1-9][0-9]*\Z")
 _EVENT_KEYS = {
     "event_id",
+    "kind",
     "posting_id",
     "thread_id",
     "entry_id",
@@ -51,13 +52,19 @@ _EVENT_KEYS = {
     "created_at",
     "box_kind",
 }
+_LEGACY_MESSAGE_EVENT_KEYS = _EVENT_KEYS - {"kind"}
 
 
 def _parse_persisted_event(value: object) -> HeyEvent:
-    if not isinstance(value, dict) or set(value) != _EVENT_KEYS:
+    if not isinstance(value, dict):
+        raise TypeError("invalid persisted HEY event")
+    normalized = dict(value)
+    if set(normalized) == _LEGACY_MESSAGE_EVENT_KEYS:
+        normalized["kind"] = "message"
+    elif set(normalized) != _EVENT_KEYS:
         raise ValueError("invalid persisted HEY event")
-    parsed = HeyEvent.from_dict(value)
-    if parsed.to_dict() != value:
+    parsed = HeyEvent.from_dict(normalized)
+    if parsed.to_dict() != normalized:
         raise ValueError("persisted HEY event requires coercion")
     return parsed
 
@@ -513,13 +520,15 @@ class DurableQueue:
             seen_identities = set(value["seen"])
             if len(seen_identities) != len(value["seen"]):
                 raise ValueError("duplicate seen HEY identity")
-            pending_identities = {
-                _parse_persisted_event(item).identity for item in value["pending"]
-            }
+            parsed_pending = [
+                _parse_persisted_event(item) for item in value["pending"]
+            ]
+            pending_identities = {item.identity for item in parsed_pending}
             if len(pending_identities) != len(value["pending"]):
                 raise ValueError("duplicate pending HEY identity")
             if not pending_identities <= seen_identities:
                 raise ValueError("pending HEY identity is missing from seen")
+            value["pending"] = [item.to_dict() for item in parsed_pending]
         except (KeyError, TypeError, ValueError):
             raise RuntimeError("HEY state is unreadable; refusing overwrite") from None
         return value

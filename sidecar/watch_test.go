@@ -139,7 +139,7 @@ func TestWatchFirstRunBaselinesWithoutHistory(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &ready); err != nil {
 		t.Fatal(err)
 	}
-	if ready.Type != "ready" || ready.ProtocolVersion != 1 {
+	if ready.Type != "ready" || ready.ProtocolVersion != 2 {
 		t.Fatalf("ready output = %#v", ready)
 	}
 }

@@ -10,6 +10,7 @@ from hey_platform.core import HeyEvent, parse_context_id, parse_ready_frame
 def event_dict() -> dict:
     return {
         "event_id": "thread:456:entry:900",
+        "kind": "message",
         "posting_id": 123,
         "thread_id": 456,
         "entry_id": 900,
@@ -34,6 +35,23 @@ def test_sidecar_event_round_trips_exactly() -> None:
     assert event.timestamp == datetime(2026, 8, 25, 16, 9, 59, tzinfo=UTC)
     assert event.to_dict() == event_dict()
     assert HeyEvent.from_dict(event.to_dict()) == event
+
+
+@pytest.mark.parametrize("kind", ["message", "comment"])
+def test_sidecar_event_accepts_only_supported_entry_kinds(kind: str) -> None:
+    value = event_dict()
+    value["kind"] = kind
+
+    assert HeyEvent.from_dict(value).kind == kind
+
+
+@pytest.mark.parametrize("kind", ["", "note", "Comment", 1, None])
+def test_sidecar_event_rejects_unsupported_entry_kinds(kind: object) -> None:
+    value = event_dict()
+    value["kind"] = kind
+
+    with pytest.raises((TypeError, ValueError), match="kind"):
+        HeyEvent.from_dict(value)
 
 
 @pytest.mark.parametrize("mutation", ["extra", "missing"])
@@ -77,6 +95,7 @@ def test_sidecar_event_sender_id_must_be_an_exact_positive_integer(sender_id: ob
     "field",
     [
         "event_id",
+        "kind",
         "sender_name",
         "sender_email",
         "subject",

@@ -7,16 +7,16 @@ Native [HEY](https://www.hey.com/) email platform adapter for [Hermes Agent](htt
 ## Behavior
 
 - Polls HEY's SDK posting-changes feeds with persisted per-box cursors.
-- Hydrates topic entries by type and calls `Messages.Get` only for a selected `kind="message"` entry. Collab comments are never treated as email messages.
+- Hydrates topic entries by type: `kind="message"` uses `Messages.Get`, while `kind="comment"` is read directly from the typed topic entry and is never treated as an email message.
 - Selects the exact position reported by `posting.visible_entry_count`; ambiguous events fail closed.
 - Requires a Python acknowledgement after durable ingestion before advancing the SDK cursor. A restart before acknowledgement replays the event safely.
-- Ignores messages authored by the configured HEY identity.
-- Authorizes senders before writing event data to disk.
+- Ignores messages and Collab comments authored by the configured HEY identity.
+- Authorizes message senders and comment authors before writing event data to disk.
 - Routes every HEY thread to its own durable Hermes session.
-- Sends one final text reply to the same thread and removes pending work only after the SDK confirms success.
+- Sends one final response to the same thread: email events receive an email reply, while Collab comments receive another Collab comment and never an email. Pending work is removed only after the intended SDK mutation confirms success.
 - Serializes work per thread across adapter reconnects and rejects progress, error, media-fallback, and duplicate sends.
 
-Remote email is untrusted input. The adapter requires either an explicit `allow_from` list or the deliberate opt-in `allow_all_users: true`.
+Remote email and Collab comments are untrusted input. An authorized Collab comment is dispatched as an agent assignment. The adapter requires either an explicit `allow_from` list or the deliberate opt-in `allow_all_users: true`.
 
 ## Requirements
 
@@ -45,7 +45,7 @@ hey auth login --no-browser
 hey account list --json
 ```
 
-The CLI is not used for watch, hydration, identity checks, or replies after setup.
+The CLI is not used for watch, hydration, identity checks, email replies, or Collab comment replies after setup.
 
 ## Installation
 
@@ -120,7 +120,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md), [SECURITY.md](SECURITY.md), and [RELEASE
 
 ## Limitations
 
-- HEY email cannot be edited after sending, so Hermes emits no progress mail and only one final response.
+- HEY email and Collab comments are non-progressive transports: Hermes emits no interim output and only one final response of the matching type.
 - Pending work remains queued if processing finishes without a confirmed SDK reply.
 - Final responses are text-only; attachment fallbacks do not create a second email.
 - Initial startup intentionally baselines existing box cursors and does not replay mailbox history.

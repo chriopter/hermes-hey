@@ -53,6 +53,7 @@ async def run_blocking(func, /, *args, **kwargs):
 class HeyClient(Protocol):
     def verify(self) -> bool: ...
     def reply(self, thread_id: int, text: str) -> dict[str, Any]: ...
+    def comment(self, thread_id: int, text: str) -> dict[str, Any]: ...
 
 
 class HeyWatcher(Protocol):
@@ -172,6 +173,19 @@ class HeyAdapter(BasePlatformAdapter):
     def _claimed_identity(self, thread_id: int) -> str | None:
         with self._claim_lock:
             return self._claims.get(self._state_key, {}).get(thread_id)
+
+    def _claimed_event(self, thread_id: int) -> HeyEvent | None:
+        identity = self._claimed_identity(thread_id)
+        if identity is None:
+            return None
+        return next(
+            (
+                event
+                for event in self.queue.pending()
+                if event.identity == identity and event.thread_id == thread_id
+            ),
+            None,
+        )
 
     def _release_claim(self, identity: str) -> None:
         with self._claim_lock:
@@ -407,11 +421,13 @@ class HeyAdapter(BasePlatformAdapter):
             "thread_id": event.thread_id,
             "posting_id": event.posting_id,
             "entry_id": event.entry_id,
+            "entry_kind": event.kind,
             "account_id": event.account_id,
             "app_url": event.app_url,
             "delivery_ids": [event.identity],
         }
-        text = f"HEY email: {event.subject}\n\n{event.content}\n\nHEY event metadata:\n"
+        label = "HEY Collab note" if event.kind == "comment" else "HEY email"
+        text = f"{label}: {event.subject}\n\n{event.content}\n\nHEY event metadata:\n"
         text += json.dumps(payload, ensure_ascii=False, sort_keys=True)
         message = MessageEvent(
             text=text,
@@ -507,16 +523,27 @@ class HeyAdapter(BasePlatformAdapter):
                 retryable=False,
             )
         thread_id = parse_context_id(chat_id)
+        event = self._claimed_event(thread_id)
+        if event is None:
+            return SendResult(
+                success=False,
+                error="HEY final response has no claimed pending event",
+                retryable=False,
+            )
+        mutation = self.client.comment if event.kind == "comment" else self.client.reply
+        mutation_name = "comment" if event.kind == "comment" else "reply"
         try:
-            result = await run_blocking(self.client.reply, thread_id, content)
+            result = await run_blocking(mutation, thread_id, content)
         except RuntimeError as exc:
             error = str(exc)
             return SendResult(
                 success=False, error=error, retryable=self._retryable(error)
             )
         except Exception:
-            logger.exception("Unexpected HEY reply failure")
-            return SendResult(success=False, error="HEY reply failed", retryable=False)
+            logger.exception("Unexpected HEY %s failure", mutation_name)
+            return SendResult(
+                success=False, error=f"HEY {mutation_name} failed", retryable=False
+            )
         if (
             type(result) is not dict
             or set(result) != {"ok"}
@@ -524,7 +551,7 @@ class HeyAdapter(BasePlatformAdapter):
         ):
             return SendResult(
                 success=False,
-                error="HEY SDK reply returned invalid response",
+                error=f"HEY SDK {mutation_name} returned invalid response",
                 retryable=False,
             )
         return SendResult(success=True, raw_response=result)

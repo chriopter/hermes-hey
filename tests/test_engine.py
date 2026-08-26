@@ -19,6 +19,7 @@ from hey_platform.engine import DurableQueue
 def event(entry_id: int, sender: str = "authorized@example.com", content: str = "work") -> HeyEvent:
     return HeyEvent(
         event_id=f"thread:456:entry:{entry_id}",
+        kind="message",
         posting_id=123,
         thread_id=456,
         entry_id=entry_id,
@@ -64,6 +65,20 @@ def test_authorized_event_survives_restart_until_exact_delivery_completion(tmp_p
 
     restarted.complete(item.identity)
     assert DurableQueue(path).pending() == []
+
+
+def test_legacy_pending_event_without_kind_migrates_to_message(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    item = event(900)
+    legacy = item.to_dict()
+    del legacy["kind"]
+    write_state(path, {"seen": [item.identity], "pending": [legacy]})
+
+    pending = DurableQueue(path).pending()
+
+    assert len(pending) == 1
+    assert pending[0].kind == "message"
+    assert pending[0].identity == item.identity
 
 
 def test_duplicate_event_is_dispatched_only_once(tmp_path: Path) -> None:

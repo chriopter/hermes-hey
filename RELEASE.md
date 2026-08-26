@@ -41,4 +41,4 @@ The release identity policy is deliberate: Christopher authors and commits local
 - Verify plugin discovery and SDK identity/account checks.
 - Verify a clean first-run cursor baseline does not replay history.
 - Send one new synthetic authorized email containing an image and a thread with a Collab comment.
-- Read back one visible same-thread reply and verify pending state cleared only afterward.
+- Read back one visible same-thread email reply and one Collab-comment response; verify each used only its matching transport and pending state cleared only afterward.

@@ -8,40 +8,6 @@ import (
 	"github.com/basecamp/hey-sdk/go/pkg/generated"
 )
 
-func TestVisibleMessageEntryIgnoresHistoricalComment(t *testing.T) {
-	entriesNewestFirst := []generated.Entry{
-		{Id: 303, Kind: "message"},
-		{Id: 202, Kind: "comment"},
-		{Id: 101, Kind: "message"},
-	}
-
-	entry := visibleMessageEntry(entriesNewestFirst, 3)
-	if entry == nil || entry.Id != 303 {
-		t.Fatalf("visibleMessageEntry() = %#v, want newest message 303", entry)
-	}
-}
-
-func TestVisibleMessageEntryDoesNotHydrateComment(t *testing.T) {
-	entriesNewestFirst := []generated.Entry{
-		{Id: 303, Kind: "message"},
-		{Id: 202, Kind: "comment"},
-		{Id: 101, Kind: "message"},
-	}
-
-	if entry := visibleMessageEntry(entriesNewestFirst, 2); entry != nil {
-		t.Fatalf("visibleMessageEntry() = %#v, want nil for comment", entry)
-	}
-}
-
-func TestVisibleMessageEntryRejectsInvalidPosition(t *testing.T) {
-	entries := []generated.Entry{{Id: 101, Kind: "message"}}
-	for _, visibleCount := range []int{0, 2} {
-		if entry := visibleMessageEntry(entries, visibleCount); entry != nil {
-			t.Fatalf("visibleMessageEntry(%d) = %#v, want nil", visibleCount, entry)
-		}
-	}
-}
-
 type fakeHydrationAPI struct {
 	entries      []generated.Entry
 	message      *generated.Message
@@ -104,6 +70,38 @@ func TestHydratePostingSkipsHistoricalComment(t *testing.T) {
 	}
 }
 
+func TestHydratePostingRejectsMalformedActiveComment(t *testing.T) {
+	createdAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	valid := generated.Entry{
+		Id: 202, Kind: "comment", Summary: "Internal assignment", CreatedAt: createdAt,
+		Creator: generated.Contact{Id: 88, Name: "Collaborator", EmailAddress: "authorized@example.com"},
+	}
+	cases := map[string]func(*generated.Entry){
+		"entry ID":      func(entry *generated.Entry) { entry.Id = 0 },
+		"created at":    func(entry *generated.Entry) { entry.CreatedAt = time.Time{} },
+		"creator ID":    func(entry *generated.Entry) { entry.Creator.Id = 0 },
+		"creator email": func(entry *generated.Entry) { entry.Creator.EmailAddress = "" },
+		"summary":       func(entry *generated.Entry) { entry.Summary = "  " },
+	}
+	posting := generated.Posting{
+		Id: 505, Kind: "topic", AppUrl: "https://app.hey.com/topics/606",
+		AccountId: 707, Name: "Synthetic subject", VisibleEntryCount: 1,
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			entry := valid
+			mutate(&entry)
+			api := &fakeHydrationAPI{entries: []generated.Entry{entry}}
+			if event, err := hydratePosting(context.Background(), api, posting, "imbox"); err == nil || event != nil {
+				t.Fatalf("hydratePosting() = (%#v, %v), want malformed comment error", event, err)
+			}
+			if len(api.messageCalls) != 0 {
+				t.Fatalf("Message calls = %v, want none", api.messageCalls)
+			}
+		})
+	}
+}
+
 func TestHydrationRejectsMismatchedSDKMessageID(t *testing.T) {
 	posting := generated.Posting{
 		Id: 505, Kind: "topic", AppUrl: "https://app.hey.com/topics/606",
@@ -131,7 +129,7 @@ func TestHydrationRejectsMismatchedSDKMessageID(t *testing.T) {
 	})
 }
 
-func TestHydratePostingSinceReturnsEveryNewMessageChronologically(t *testing.T) {
+func TestHydratePostingSinceReturnsMessagesAndCommentsChronologically(t *testing.T) {
 	since := time.Date(2026, 1, 2, 3, 4, 0, 0, time.UTC)
 	message := func(id int64, created time.Time) *generated.Message {
 		return &generated.Message{
@@ -142,7 +140,13 @@ func TestHydratePostingSinceReturnsEveryNewMessageChronologically(t *testing.T) 
 	api := &fakeHydrationAPI{
 		entries: []generated.Entry{
 			{Id: 303, Kind: "message"},
-			{Id: 250, Kind: "comment"},
+			{
+				Id: 250, Kind: "comment", Summary: "Internal assignment",
+				CreatedAt: since.Add(90 * time.Second),
+				Creator: generated.Contact{
+					Id: 88, Name: "Authorized Collaborator", EmailAddress: "authorized@example.com",
+				},
+			},
 			{Id: 202, Kind: "message"},
 			{Id: 101, Kind: "message"},
 		},
@@ -161,18 +165,26 @@ func TestHydratePostingSinceReturnsEveryNewMessageChronologically(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 2 || events[0].EntryID != 202 || events[1].EntryID != 303 {
-		t.Fatalf("hydratePostingSince() = %#v, want entries 202 then 303", events)
+	if len(events) != 3 || events[0].EntryID != 202 || events[1].EntryID != 250 || events[2].EntryID != 303 {
+		t.Fatalf("hydratePostingSince() = %#v, want entries 202, 250, then 303", events)
+	}
+	comment := events[1]
+	if comment.Kind != "comment" || comment.Content != "Internal assignment" || comment.SenderEmail != "authorized@example.com" {
+		t.Fatalf("comment event = %#v", comment)
 	}
 	if got := api.messageCalls; len(got) != 3 || got[0] != 303 || got[1] != 202 || got[2] != 101 {
 		t.Fatalf("Message calls = %v, want [303 202 101] and never comment 250", got)
 	}
 }
 
-func TestHydratePostingDoesNotLoadActiveComment(t *testing.T) {
+func TestHydratePostingBuildsActiveCommentWithoutMessageGet(t *testing.T) {
+	createdAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	api := &fakeHydrationAPI{entries: []generated.Entry{
 		{Id: 303, Kind: "message"},
-		{Id: 202, Kind: "comment"},
+		{
+			Id: 202, Kind: "comment", Summary: "Internal assignment", CreatedAt: createdAt,
+			Creator: generated.Contact{Id: 88, Name: "Authorized Collaborator", EmailAddress: "authorized@example.com"},
+		},
 		{Id: 101, Kind: "message"},
 	}}
 	posting := generated.Posting{
@@ -186,8 +198,8 @@ func TestHydratePostingDoesNotLoadActiveComment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event != nil {
-		t.Fatalf("hydratePosting() = %#v, want nil", event)
+	if event == nil || event.Kind != "comment" || event.EntryID != 202 || event.Content != "Internal assignment" {
+		t.Fatalf("hydratePosting() = %#v, want comment entry 202", event)
 	}
 	if len(api.messageCalls) != 0 {
 		t.Fatalf("Message calls = %v, want none for active comment", api.messageCalls)

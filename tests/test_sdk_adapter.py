@@ -29,6 +29,9 @@ class FakeSDKClient:
     def reply(self, thread_id: int, text: str) -> dict:
         return {"ok": True}
 
+    def comment(self, thread_id: int, text: str) -> dict:
+        return {"ok": True}
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verify_result", [False, 1, None, {"ok": True}])
@@ -125,6 +128,7 @@ def test_adapter_accepts_exact_go_int64_maximum(tmp_path: Path) -> None:
 def event(sender: str = "authorized@example.com") -> HeyEvent:
     return HeyEvent(
         event_id="thread:456:entry:900",
+        kind="message",
         posting_id=123,
         thread_id=456,
         entry_id=900,

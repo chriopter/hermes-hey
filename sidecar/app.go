@@ -132,9 +132,37 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 			return classifyReplyClientError(err)
 		}
 		return runReply(ctx, sdkAdapter{client: scoped}, threadID, in, out)
+	case "comment":
+		fs := newFlagSet("comment")
+		accountText, _, configDir, baseURL := commonFlags(fs, false)
+		threadText := fs.String("thread-id", "", "")
+		if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
+			return fmt.Errorf("invalid comment arguments")
+		}
+		account, err := validateCommon(*accountText, *configDir, *baseURL)
+		if err != nil {
+			return err
+		}
+		threadID, err := strconv.ParseInt(*threadText, 10, 64)
+		if err != nil || threadID <= 0 {
+			return fmt.Errorf("thread ID must be positive")
+		}
+		_, scoped, _, err := newSDKClients(ctx, account, *configDir, *baseURL)
+		if err != nil {
+			return classifyCommentClientError(err)
+		}
+		return runComment(ctx, sdkAdapter{client: scoped}, threadID, in, out)
 	default:
 		return fmt.Errorf("unknown mode")
 	}
+}
+
+func classifyCommentClientError(err error) error {
+	wrapped := fmt.Errorf("initialize comment client: %w", err)
+	if isTransientReadError(err) {
+		return safeRetry(wrapped)
+	}
+	return wrapped
 }
 
 func classifyReplyClientError(err error) error {
@@ -170,7 +198,7 @@ func newVerifyResponse(account int64, email string) verifyResponse {
 }
 
 const (
-	protocolVersion = 1
+	protocolVersion = 2
 	sdkVersion      = "0.24.0"
 )
 

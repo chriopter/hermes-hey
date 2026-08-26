@@ -16,9 +16,10 @@ SDK box posting-changes cursor
         ▼
 SDK topic entries (typed, paginated)
         │ exact posting.visible_entry_count position
-        ├─ comment/other → skip; never Messages.Get
-        └─ message → SDK Messages.Get
-                         │ complete sidecar event
+        ├─ comment → typed entry; never Messages.Get
+        ├─ message → SDK Messages.Get
+        └─ other → skip
+                         │ complete typed sidecar event
                          ▼
 self-filter → account binding → sender authorization
                          │ accepted events only
@@ -30,9 +31,9 @@ NDJSON ack to sidecar → atomically advance box cursor
                          │
                          ▼
 Hermes MessageEvent → persistent `thread:<id>` session
-                         │ one final text response
+                         │ one final response matching input kind
                          ▼
-SDK Entries.NewReply → SDK Entries.CreateReply
+message → SDK Entries reply; comment → SDK Collab comment
                          │ confirmed success
                          ▼
 complete exact durable event identity
@@ -43,7 +44,8 @@ complete exact durable event identity
 - `verify` validates protocol version, authenticated identity, account membership, and configured email.
 - `watch` emits `ready`, `event`, and redacted `fatal` NDJSON frames. Each event blocks cursor advancement until Python returns `{"ack":"thread:<id>:entry:<id>"}`.
 - `reply` reads the body from JSON stdin, asks HEY for server-computed reply recipients, and performs at most one same-thread reply mutation per sidecar invocation.
-- Reply content and tokens never appear in process arguments, stdout diagnostics, or logs.
+- `comment` reads the body from JSON stdin and performs at most one same-thread Collab-comment mutation per sidecar invocation.
+- Reply/comment content and tokens never appear in process arguments, stdout diagnostics, or logs.
 
 ## Identity and context
 
@@ -67,8 +69,8 @@ The normalized sender email is matched against `platforms.hey.allow_from`. An em
 - Process-wide per-state-path thread claims prevent concurrent same-thread dispatch across replacement adapters.
 - Failures and cancellations release exact work for a live replacement; reconnect gaps retain pending state.
 - Sidecar process failures use bounded exponential supervision. External bodies and stderr are normalized to redacted operation errors.
-- Reply mutations are never retried after an ambiguous outcome. The retryable process code is limited to classified transient failures during the pre-mutation recipient read, plus mutation responses that definitively confirm non-application with HTTP 404, 409, 422, or 429. Timeouts, connection loss, 5xx responses, and any other ambiguous mutation outcome are non-retryable.
+- Reply and comment mutations are never retried after an ambiguous outcome. The retryable process code is limited to classified transient failures before mutation, plus responses that definitively confirm non-application with HTTP 404, 409, 422, or 429. Timeouts, connection loss, 5xx responses, and any other ambiguous mutation outcome are non-retryable.
 
-## Email transport
+## Final-response transport
 
-Sent email cannot be edited. `SUPPORTS_MESSAGE_EDITING` is false and HEY display defaults suppress tool, thinking, interim, heartbeat, and busy progress. Direct, error, media, and fallback sends are rejected. Only the final text path may invoke the SDK reply operation, and pending work is completed only after confirmed success.
+Sent email and Collab comments cannot be edited. `SUPPORTS_MESSAGE_EDITING` is false and HEY display defaults suppress tool, thinking, interim, heartbeat, and busy progress. Direct, error, media, and fallback sends are rejected. Only the final text path may invoke the mutation matching the durable event kind: email reply for `message`, Collab comment for `comment`. Pending work is completed only after confirmed success.

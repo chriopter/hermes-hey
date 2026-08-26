@@ -580,7 +580,7 @@ class HeySDKWatch:
 class HeySDKClient:
     """Synchronous command client for the official-SDK sidecar."""
 
-    PROTOCOL_VERSION = 1
+    PROTOCOL_VERSION = 2
 
     def __init__(self, runner: PayloadRunner, *, account: str, own_email: str):
         self.runner = runner
@@ -620,4 +620,12 @@ class HeySDKClient:
         )
         if set(result) != {"ok"} or result.get("ok") is not True:
             raise RuntimeError("HEY SDK reply failed")
+        return result
+
+    def comment(self, thread_id: int, text: str) -> dict[str, Any]:
+        result = self.runner(
+            ["comment", "--thread-id", str(thread_id)], {"content": text}
+        )
+        if set(result) != {"ok"} or result.get("ok") is not True:
+            raise RuntimeError("HEY SDK comment failed")
         return result

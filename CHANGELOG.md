@@ -5,6 +5,9 @@
 - Keep the plugin registry, adapter, session source, gateway authorization, and startup restore on the same dynamic `hey` platform identity
 - Declare HEY's local allowlist contract explicitly so the gateway rechecks sender authorization without requiring global email environment variables
 - Document an atomic Hermes configuration command that preserves the account ID as a canonical decimal string
+- Dispatch authorized HEY Collab comments as durable assignments and answer them only with same-thread Collab comments, never email
+- Read typed comments directly from topic entries without calling `Messages.Get` for comment IDs
+- Add exact `message|comment` event typing, migrate legacy pending events to `message`, and bump the sidecar wire protocol to version 2
 
 ## 0.2.0 - 2026-08-25
 

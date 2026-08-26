@@ -25,7 +25,9 @@ class FakeSDKClient:
     def __init__(self, event: HeyEvent | None):
         self.event = event
         self.replies: list[tuple[int, str]] = []
+        self.comments: list[tuple[int, str]] = []
         self.fail_reply = False
+        self.fail_comment = False
         self.identity_matches = True
 
     def verify(self):
@@ -37,6 +39,12 @@ class FakeSDKClient:
         self.replies.append((thread_id, text))
         if self.fail_reply:
             raise RuntimeError("HEY SDK reply failed (exit 75)")
+        return {"ok": True}
+
+    def comment(self, thread_id: int, text: str):
+        self.comments.append((thread_id, text))
+        if self.fail_comment:
+            raise RuntimeError("HEY SDK comment failed (exit 75)")
         return {"ok": True}
 
 
@@ -55,9 +63,11 @@ def event(
     *,
     entry_id: int = 900,
     thread_id: int = 456,
+    kind: str = "message",
 ) -> HeyEvent:
     return HeyEvent(
         event_id=f"thread:{thread_id}:entry:{entry_id}",
+        kind=kind,
         posting_id=123,
         thread_id=thread_id,
         entry_id=entry_id,
@@ -190,7 +200,7 @@ async def test_verified_ready_reschedules_durable_pending_work(
             return None
 
         async def lines(self):
-            yield {"type": "ready", "protocol_version": 1}
+            yield {"type": "ready", "protocol_version": 2}
             yield {"type": "fatal"}
 
     drains = 0
@@ -308,8 +318,8 @@ async def test_watch_rejects_duplicate_ready_without_persistence_or_ack(
             return None
 
         async def lines(self):
-            yield {"type": "ready", "protocol_version": 1}
-            yield {"type": "ready", "protocol_version": 1}
+            yield {"type": "ready", "protocol_version": 2}
+            yield {"type": "ready", "protocol_version": 2}
             yield {"type": "event", "event": event().to_dict()}
 
     fatal_notified = False
@@ -354,7 +364,7 @@ async def test_ready_then_failure_still_reaches_consecutive_failure_threshold(
                     yield {}
                 raise RuntimeError("first disconnect")
             if SequenceWatch.calls == 2:
-                yield {"type": "ready", "protocol_version": 1}
+                yield {"type": "ready", "protocol_version": 2}
                 raise RuntimeError("later disconnect")
             raise asyncio.CancelledError
             yield {}
@@ -400,7 +410,7 @@ async def test_stable_watch_runtime_resets_prior_failure_budget(
         async def lines(self):
             SequenceWatch.calls += 1
             if SequenceWatch.calls == 2:
-                yield {"type": "ready", "protocol_version": 1}
+                yield {"type": "ready", "protocol_version": 2}
             raise RuntimeError("disconnect")
             yield {}
 
@@ -586,6 +596,37 @@ async def test_completed_event_releases_thread_and_dispatches_next(tmp_path: Pat
     await asyncio.sleep(0.02)
 
     assert [message.message_id for message in handled] == [first.identity, second.identity]
+
+
+@pytest.mark.asyncio
+async def test_same_thread_email_then_comment_use_distinct_mutations_in_order(
+    tmp_path: Path,
+) -> None:
+    cli = FakeSDKClient(None)
+    instance = adapter(tmp_path, cli)
+    first = event(entry_id=900, kind="message")
+    second = event(entry_id=901, kind="comment")
+    instance.queue.ingest(first, lambda _event: True)
+    instance.queue.ingest(second, lambda _event: True)
+    handled: list[MessageEvent] = []
+
+    async def capture(event: MessageEvent):
+        handled.append(event)
+
+    instance.handle_message = capture
+    instance._register_live_adapter()
+    await instance._drain_pending()
+    assert [message.message_id for message in handled] == [first.identity]
+
+    assert (await instance._send_with_retry("thread:456", "Email response")).success
+    await instance.on_processing_complete(handled[0], ProcessingOutcome.SUCCESS)
+    await asyncio.sleep(0.02)
+    assert [message.message_id for message in handled] == [first.identity, second.identity]
+
+    assert (await instance._send_with_retry("thread:456", "Internal response")).success
+    assert cli.replies == [(456, "Email response")]
+    assert cli.comments == [(456, "Internal response")]
+    assert instance.queue.pending() == []
 
 
 @pytest.mark.asyncio
@@ -918,7 +959,33 @@ async def test_authorized_email_routes_one_session_per_thread_and_stays_pending(
     assert [item.identity for item in instance.queue.pending()] == [event().identity]
 
 
-def test_explicit_allow_all_policy_still_blocks_self_authored_email(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_authorized_comment_routes_as_collab_note_assignment(tmp_path: Path) -> None:
+    note = event(kind="comment", content="Internal assignment")
+    instance = adapter(tmp_path, FakeSDKClient(note))
+    handled: list[MessageEvent] = []
+
+    async def capture(event: MessageEvent):
+        handled.append(event)
+
+    instance.handle_message = capture
+    watch = AckWatch()
+    instance._watch = cast(Any, watch)
+
+    await instance.process_watch_line({"type": "event", "event": note.to_dict()})
+
+    assert len(handled) == 1
+    assert handled[0].text.startswith("HEY Collab note: Request")
+    assert handled[0].metadata["hey"]["entry_kind"] == "comment"
+    assert handled[0].raw_message["kind"] == "comment"
+    assert watch.acks == [note.identity]
+    assert [item.identity for item in instance.queue.pending()] == [note.identity]
+
+
+@pytest.mark.parametrize("kind", ["message", "comment"])
+def test_explicit_allow_all_policy_still_blocks_self_authored_event(
+    kind: str, tmp_path: Path
+) -> None:
     config = type(
         "AllowAllConfig",
         (),
@@ -942,7 +1009,7 @@ def test_explicit_allow_all_policy_still_blocks_self_authored_email(tmp_path: Pa
     assert instance._is_dm_allowed("outsider@example.com") is True
     assert instance._is_dm_allowed("agent@example.com") is False
     assert instance._authorized(event(sender="outsider@example.com")) is True
-    assert instance._authorized(event(sender="agent@example.com")) is False
+    assert instance._authorized(event(sender="agent@example.com", kind=kind)) is False
 
 
 @pytest.mark.asyncio
@@ -993,6 +1060,49 @@ async def test_confirmed_final_retry_path_completes_exact_pending_event(tmp_path
     assert result.success is True
     assert cli.replies == [(456, "Done")]
     assert instance.queue.pending() == []
+
+
+@pytest.mark.asyncio
+async def test_comment_event_final_response_uses_collab_note_and_never_email(
+    tmp_path: Path,
+) -> None:
+    note = event(kind="comment")
+    cli = FakeSDKClient(note)
+    instance = adapter(tmp_path, cli)
+    instance.queue.ingest(note, lambda _event: True)
+    assert instance._claim(note) is True
+
+    result = await instance._send_with_retry(
+        "thread:456",
+        "Internal response",
+        metadata={"entry_kind": "message"},
+    )
+
+    assert result.success is True
+    assert cli.comments == [(456, "Internal response")]
+    assert cli.replies == []
+    assert instance.queue.pending() == []
+
+
+@pytest.mark.asyncio
+async def test_failed_comment_keeps_pending_event_and_never_sends_email(
+    tmp_path: Path,
+) -> None:
+    note = event(kind="comment")
+    cli = FakeSDKClient(note)
+    cli.fail_comment = True
+    instance = adapter(tmp_path, cli)
+    instance.queue.ingest(note, lambda _event: True)
+    assert instance._claim(note) is True
+
+    result = await instance._send_with_retry(
+        "thread:456", "Internal response", base_delay=0
+    )
+
+    assert result.success is False
+    assert cli.comments == [(456, "Internal response")] * 4
+    assert cli.replies == []
+    assert [item.identity for item in instance.queue.pending()] == [note.identity]
 
 
 @pytest.mark.asyncio

@@ -35,7 +35,7 @@ func TestVerifyIdentityRequiresExactAccountAndEmail(t *testing.T) {
 
 func TestVerifyResponsePinsProtocolAndSDKVersion(t *testing.T) {
 	response := newVerifyResponse(7, "me@example.com")
-	if !response.OK || response.ProtocolVersion != 1 || response.SDKVersion != "0.24.0" {
+	if !response.OK || response.ProtocolVersion != 2 || response.SDKVersion != "0.24.0" {
 		t.Fatalf("verify response = %#v", response)
 	}
 }
@@ -100,6 +100,18 @@ func TestRedactedErrorDoesNotLeakSecretsURLsOrContent(t *testing.T) {
 	}
 }
 
+func TestRunRecognizesCommentMode(t *testing.T) {
+	err := run(
+		context.Background(),
+		[]string{"comment", "--account", "1", "--config-dir", t.TempDir(), "--thread-id", "77"},
+		strings.NewReader(`{"content":"Internal response"}`),
+		io.Discard,
+	)
+	if err == nil || strings.Contains(err.Error(), "unknown mode") {
+		t.Fatalf("comment mode error = %v", err)
+	}
+}
+
 func TestAccountArgumentsRequireCanonicalPositiveInt64(t *testing.T) {
 	const maxInt64 = "9223372036854775807"
 	account, err := parseCanonicalAccount(maxInt64)
@@ -120,6 +132,9 @@ func TestAccountArgumentsRequireCanonicalPositiveInt64(t *testing.T) {
 		},
 		"reply": func(value string) []string {
 			return []string{"reply", "--account", value, "--config-dir", t.TempDir(), "--thread-id", "1"}
+		},
+		"comment": func(value string) []string {
+			return []string{"comment", "--account", value, "--config-dir", t.TempDir(), "--thread-id", "1"}
 		},
 	}
 	for _, value := range invalid {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/basecamp/hey-sdk/go/pkg/generated"
@@ -113,6 +115,29 @@ func (a sdkAdapter) CreateReply(ctx context.Context, id int64, content string, t
 		return fmt.Errorf("entry ID must be positive")
 	}
 	return a.client.Entries().CreateReply(ctx, id, content, to, cc, bcc)
+}
+
+func (a sdkAdapter) CreateComment(ctx context.Context, threadID int64, content string) error {
+	if threadID <= 0 {
+		return fmt.Errorf("thread ID must be positive")
+	}
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("comment content is required")
+	}
+	response, err := a.client.PostForm(ctx, fmt.Sprintf("/topics/%d/comments", threadID), url.Values{
+		"comment[content]": {content},
+	})
+	if err != nil {
+		return err
+	}
+	if response == nil || response.StatusCode != http.StatusFound && response.StatusCode != http.StatusSeeOther {
+		return fmt.Errorf("comment response was not a redirect")
+	}
+	location, err := url.Parse(response.Location)
+	if err != nil || location.User != nil || location.Path != fmt.Sprintf("/topics/%d", threadID) {
+		return fmt.Errorf("comment response has invalid redirect")
+	}
+	return nil
 }
 
 const (
