@@ -71,13 +71,12 @@ ln -s /absolute/path/to/hermes-hey ~/.hermes/plugins/hey-platform
 Use `hermes config set`; do not hand-edit `config.yaml`.
 
 ```bash
-hermes config set platforms.hey.enabled true
-hermes config set platforms.hey.account '12345'
-hermes config set platforms.hey.own_email 'agent@example.com'
-hermes config set platforms.hey.config_dir '~/.config'
-hermes config set platforms.hey.allow_from '["authorized@example.com"]'
-hermes config set platforms.hey.allow_all_users false
+hermes config set --force platforms.hey '{"enabled":true,"account":"12345","own_email":"agent@example.com","config_dir":"~/.config","allow_from":["authorized@example.com"],"allow_all_users":false,"watch_failure_threshold":5}'
 ```
+
+Set the complete mapping in one command: Hermes otherwise auto-coerces a standalone
+all-digit `account` value to an integer, while this adapter intentionally requires a
+canonical decimal string.
 
 Fields:
 

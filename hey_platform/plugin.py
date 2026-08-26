@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from gateway.config import Platform
+
 from .adapter import HeyAdapter
 from .client import canonical_account
 from .core import strict_bool
@@ -163,7 +165,7 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="hey",
         label="HEY",
-        adapter_factory=lambda cfg: HeyAdapter(cfg),
+        adapter_factory=lambda cfg: HeyAdapter(cfg, platform=Platform("hey")),
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,

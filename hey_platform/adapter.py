@@ -64,6 +64,7 @@ class HeyWatcher(Protocol):
 class HeyAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False
     WATCH_STABLE_SECONDS = 30.0
+    GATEWAY_READY_POLL_SECONDS = 0.05
     _claim_lock = threading.RLock()
     _claims: ClassVar[dict[str, dict[int, str]]] = {}
     _live_adapters: ClassVar[dict[str, HeyAdapter]] = {}
@@ -102,6 +103,7 @@ class HeyAdapter(BasePlatformAdapter):
             str(value).strip().lower() for value in configured if str(value).strip()
         }
         self.allow_all_users = strict_bool(extra.get("allow_all_users", False))
+        self._dm_policy = "allowlist"
         self.failure_threshold = max(
             1, min(100, int(extra.get("watch_failure_threshold", 5)))
         )
@@ -133,6 +135,7 @@ class HeyAdapter(BasePlatformAdapter):
             "hey_final_send_allowed", default=False
         )
         self._watch_task: asyncio.Task | None = None
+        self._gateway_ready_task: asyncio.Task | None = None
         self._watch: HeyWatcher | None = None
         self._lock_acquired = False
         self._credential_key = self.credential_dir
@@ -141,11 +144,21 @@ class HeyAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "HEY"
 
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        return True
+
+    def _is_dm_allowed(self, user_id: str) -> bool:
+        sender = str(user_id or "").strip().lower()
+        return bool(sender) and sender != self.own_email and (
+            self.allow_all_users or sender in self.allowed_senders
+        )
+
     def _authorized(self, event: HeyEvent) -> bool:
         sender = event.sender_email.lower()
         if not sender or sender == self.own_email:
             return False
-        return self.allow_all_users or sender in self.allowed_senders
+        return self._is_dm_allowed(sender)
 
     def _claim(self, event: HeyEvent) -> bool:
         with self._claim_lock:
@@ -224,6 +237,9 @@ class HeyAdapter(BasePlatformAdapter):
                 raise RuntimeError("HEY SDK client verification did not return true")
             self._register_live_adapter()
             await self._drain_pending()
+            self._gateway_ready_task = asyncio.create_task(
+                self._drain_when_gateway_ready()
+            )
             self._watch_task = asyncio.create_task(self._watch_supervisor())
         except Exception as exc:  # noqa: BLE001
             self._unregister_live_adapter()
@@ -234,6 +250,13 @@ class HeyAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        if self._gateway_ready_task and not self._gateway_ready_task.done():
+            self._gateway_ready_task.cancel()
+            try:
+                await self._gateway_ready_task
+            except asyncio.CancelledError:
+                pass
+        self._gateway_ready_task = None
         if self._watch_task and not self._watch_task.done():
             self._watch_task.cancel()
             if self._watch:
@@ -336,6 +359,11 @@ class HeyAdapter(BasePlatformAdapter):
                 self.queue.complete(event.identity)
                 self._inflight.discard(event.identity)
                 continue
+            gateway_authorized = self._is_sender_authorized(
+                event.sender_email, "dm", event.context_id
+            )
+            if gateway_authorized is False:
+                continue
             if not self._claim(event):
                 continue
             try:
@@ -343,6 +371,27 @@ class HeyAdapter(BasePlatformAdapter):
             except Exception:
                 self._release_claim(event.identity)
                 raise
+
+    async def _drain_when_gateway_ready(self) -> None:
+        probe_senders = sorted(
+            sender for sender in self.allowed_senders if self._is_dm_allowed(sender)
+        )
+        if probe_senders:
+            probe_sender = probe_senders[0]
+        elif self.allow_all_users:
+            probe_sender = "hermes-hey-readiness-probe@invalid"
+        else:
+            return
+        while True:
+            gateway_authorized = self._is_sender_authorized(
+                probe_sender, "dm", "thread:gateway-readiness"
+            )
+            if gateway_authorized is None:
+                return
+            if gateway_authorized is True:
+                await self._drain_pending()
+                return
+            await asyncio.sleep(self.GATEWAY_READY_POLL_SECONDS)
 
     async def _dispatch(self, event: HeyEvent) -> None:
         source = self.build_source(

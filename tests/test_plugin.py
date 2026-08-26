@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import tomllib
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -107,7 +109,8 @@ def test_connected_check_requires_account_identity_and_cli_credentials(tmp_path,
 def test_platform_registry_creates_adapter_with_configured_executable_outside_path(
     tmp_path, monkeypatch
 ) -> None:
-    from gateway.platform_registry import PlatformEntry, PlatformRegistry
+    from gateway.platform_registry import PlatformEntry, platform_registry
+    from gateway.run import GatewayRunner
 
     sidecar = tmp_path / "private" / "hermes-hey-sidecar"
     sidecar.parent.mkdir()
@@ -131,13 +134,61 @@ def test_platform_registry_creates_adapter_with_configured_executable_outside_pa
     register(context)
     registration = context.registration
     assert registration is not None
-    registry = PlatformRegistry()
-    registry.register(PlatformEntry(source="builtin", **registration))
+    previous_registration = platform_registry.get("hey")
+    platform_registry.register(PlatformEntry(source="builtin", **registration))
+    try:
+        created = platform_registry.create_adapter("hey", config)
+        assert created is not None
+        assert created.sidecar_binary == str(sidecar)
+        assert created.platform.value == "hey"
+        assert created.enforces_own_access_policy is True
+        assert created._dm_policy == "allowlist"
+        assert created._is_dm_allowed("AUTHORIZED@EXAMPLE.COM") is True
+        assert created._is_dm_allowed("outsider@example.com") is False
 
-    created = registry.create_adapter("hey", config)
+        runner = cast(Any, object.__new__(GatewayRunner))
+        runner.adapters = {created.platform: created}
+        runner._profile_adapters = {}
+        runner.pairing_store = None
+        runner.pairing_stores = {}
+        for key in (
+            "EMAIL_ALLOWED_USERS",
+            "GATEWAY_ALLOWED_USERS",
+            "EMAIL_ALLOW_ALL_USERS",
+            "GATEWAY_ALLOW_ALL_USERS",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        allowed = created.build_source(
+            chat_id="thread:456",
+            chat_type="dm",
+            user_id="authorized@example.com",
+        )
+        denied = created.build_source(
+            chat_id="thread:789",
+            chat_type="dm",
+            user_id="outsider@example.com",
+        )
 
-    assert created is not None
-    assert created.sidecar_binary == str(sidecar)
+        assert runner._is_user_authorized(allowed) is True
+        assert runner._is_user_authorized(denied) is False
+
+        restored: list[object] = []
+
+        async def capture_restored(message) -> None:
+            restored.append(message)
+
+        created.handle_message = capture_restored
+        queued = type("QueuedEvent", (), {"source": allowed})()
+        runner._startup_restore_queue = [queued]
+        drained = asyncio.run(GatewayRunner._drain_startup_restore_queue(runner))
+
+        assert drained == 1
+        assert restored == [queued]
+        assert runner._startup_restore_queue == []
+    finally:
+        platform_registry.unregister("hey", scope=None)
+        if previous_registration is not None:
+            platform_registry.register(previous_registration)
 
 
 @pytest.mark.parametrize(
@@ -243,3 +294,6 @@ def test_readme_uses_exact_checksum_entry() -> None:
     readme = (Path(__file__).parents[1] / "README.md").read_text()
 
     assert 'sha256sum -c <(grep -Fx "$HEY_CLI_SHA256  $HEY_CLI_ARCHIVE" checksums.txt)' in readme
+    assert "hermes config set --force platforms.hey" in readme
+    assert '"account":"12345"' in readme
+    assert "hermes config set platforms.hey.account" not in readme

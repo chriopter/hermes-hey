@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Keep the plugin registry, adapter, session source, gateway authorization, and startup restore on the same dynamic `hey` platform identity
+- Declare HEY's local allowlist contract explicitly so the gateway rechecks sender authorization without requiring global email environment variables
+- Document an atomic Hermes configuration command that preserves the account ID as a canonical decimal string
+
 ## 0.2.0 - 2026-08-25
 
 - Replace the runtime HEY CLI transport with a Go sidecar pinned to the official `hey-sdk/go` v0.24.0

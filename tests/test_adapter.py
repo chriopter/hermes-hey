@@ -430,6 +430,124 @@ async def test_stable_watch_runtime_resets_prior_failure_budget(
 
 
 @pytest.mark.asyncio
+async def test_pending_waits_for_gateway_registration_authorization(tmp_path: Path) -> None:
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    pending = event()
+    instance.queue.ingest(pending, lambda _event: True)
+    gateway_ready = False
+    handled: list[MessageEvent] = []
+
+    instance.set_authorization_check(
+        lambda _user_id, _chat_type, _chat_id: gateway_ready
+    )
+
+    async def capture(event: MessageEvent) -> None:
+        handled.append(event)
+
+    instance.handle_message = capture
+
+    await instance._drain_pending()
+    assert handled == []
+    assert [item.identity for item in instance.queue.pending()] == [pending.identity]
+
+    gateway_ready = True
+    await instance._drain_pending()
+    assert [message.message_id for message in handled] == [pending.identity]
+
+
+@pytest.mark.asyncio
+async def test_pending_retries_automatically_after_gateway_registration(tmp_path: Path) -> None:
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    pending = event()
+    instance.queue.ingest(pending, lambda _event: True)
+    gateway_ready = False
+    handled: list[MessageEvent] = []
+
+    instance.GATEWAY_READY_POLL_SECONDS = 0.001
+    instance.set_authorization_check(
+        lambda _user_id, _chat_type, _chat_id: gateway_ready
+    )
+
+    async def capture(event: MessageEvent) -> None:
+        handled.append(event)
+
+    instance.handle_message = capture
+    task = asyncio.create_task(instance._drain_when_gateway_ready())
+    await asyncio.sleep(0.01)
+    assert handled == []
+
+    gateway_ready = True
+    await asyncio.wait_for(task, timeout=1)
+
+    assert [message.message_id for message in handled] == [pending.identity]
+
+
+@pytest.mark.asyncio
+async def test_empty_queue_retry_waits_for_late_event_and_gateway_registration(
+    tmp_path: Path,
+) -> None:
+    instance = adapter(tmp_path, FakeSDKClient(event()))
+    pending = event()
+    gateway_ready = False
+    handled: list[MessageEvent] = []
+
+    instance.GATEWAY_READY_POLL_SECONDS = 0.001
+    instance.set_authorization_check(
+        lambda _user_id, _chat_type, _chat_id: gateway_ready
+    )
+
+    async def capture(event: MessageEvent) -> None:
+        handled.append(event)
+
+    instance.handle_message = capture
+    task = asyncio.create_task(instance._drain_when_gateway_ready())
+    await asyncio.sleep(0.01)
+    assert task.done() is False
+
+    instance.queue.ingest(pending, lambda _event: True)
+    await instance._drain_pending()
+    assert handled == []
+
+    gateway_ready = True
+    await asyncio.wait_for(task, timeout=1)
+
+    assert [message.message_id for message in handled] == [pending.identity]
+
+
+@pytest.mark.asyncio
+async def test_gateway_readiness_probe_ignores_own_email_in_allowlist(
+    tmp_path: Path,
+) -> None:
+    config = type(
+        "MixedAllowlistConfig",
+        (),
+        {
+            "enabled": True,
+            "extra": {
+                "account": "12345",
+                "own_email": "agent@example.com",
+                "allow_from": ["agent@example.com", "authorized@example.com"],
+                "allow_all_users": False,
+            },
+        },
+    )()
+    instance = HeyAdapter(
+        config,
+        client=FakeSDKClient(None),
+        state_path=tmp_path / "state.json",
+        platform=Platform.EMAIL,
+    )
+    probes: list[str] = []
+    instance.set_authorization_check(
+        lambda user_id, _chat_type, _chat_id: not probes.append(user_id)
+    )
+
+    await instance._drain_when_gateway_ready()
+
+    assert probes == ["authorized@example.com"]
+
+
+@pytest.mark.asyncio
 async def test_drain_dispatches_only_one_pending_event_per_thread(tmp_path: Path) -> None:
     instance = adapter(tmp_path, FakeSDKClient(event()))
     first = event(entry_id=900)
@@ -798,6 +916,33 @@ async def test_authorized_email_routes_one_session_per_thread_and_stays_pending(
     assert message.text.startswith("HEY email: Request")
     assert watch.acks == [event().identity]
     assert [item.identity for item in instance.queue.pending()] == [event().identity]
+
+
+def test_explicit_allow_all_policy_still_blocks_self_authored_email(tmp_path: Path) -> None:
+    config = type(
+        "AllowAllConfig",
+        (),
+        {
+            "enabled": True,
+            "extra": {
+                "account": "12345",
+                "own_email": "agent@example.com",
+                "allow_from": [],
+                "allow_all_users": True,
+            },
+        },
+    )()
+    instance = HeyAdapter(
+        config,
+        client=FakeSDKClient(None),
+        state_path=tmp_path / "state.json",
+        platform=Platform.EMAIL,
+    )
+
+    assert instance._is_dm_allowed("outsider@example.com") is True
+    assert instance._is_dm_allowed("agent@example.com") is False
+    assert instance._authorized(event(sender="outsider@example.com")) is True
+    assert instance._authorized(event(sender="agent@example.com")) is False
 
 
 @pytest.mark.asyncio
