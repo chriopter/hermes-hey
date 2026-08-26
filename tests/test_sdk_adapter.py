@@ -261,3 +261,109 @@ async def test_event_frame_requires_exact_outer_keys(tmp_path: Path) -> None:
         await instance.process_watch_line(
             {"type": "event", "event": event().to_dict(), "unexpected": True}
         )
+
+
+@pytest.mark.asyncio
+async def test_fatal_frame_surfaces_the_sidecar_error(tmp_path: Path) -> None:
+    instance = HeyAdapter(
+        Config(),
+        client=FakeSDKClient(),
+        state_path=tmp_path / "state.json",
+        platform=Platform.EMAIL,
+    )
+
+    with pytest.raises(RuntimeError, match="acknowledgement failed"):
+        await instance.process_watch_line(
+            {"type": "fatal", "error": "acknowledgement failed"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_malformed_fatal_frame_fails_closed(tmp_path: Path) -> None:
+    instance = HeyAdapter(
+        Config(),
+        client=FakeSDKClient(),
+        state_path=tmp_path / "state.json",
+        platform=Platform.EMAIL,
+    )
+
+    with pytest.raises(RuntimeError, match="malformed fatal frame"):
+        await instance.process_watch_line(
+            {"type": "fatal", "error": "boom", "extra": True}
+        )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_surfaces_exact_fatal_frame_before_ready(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    import hey_platform.adapter as adapter_module
+
+    class FatalBeforeReadyWatch:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def lines(self):
+            yield {"type": "fatal", "error": "exact acknowledgement failure"}
+
+        async def stop(self) -> None:
+            return None
+
+    instance = HeyAdapter(
+        Config(),
+        client=FakeSDKClient(),
+        state_path=tmp_path / "state.json",
+        platform=Platform.EMAIL,
+    )
+    instance.failure_threshold = 1
+
+    async def ignore_fatal_notification() -> None:
+        return None
+
+    instance._notify_fatal_error = ignore_fatal_notification
+    monkeypatch.setattr(adapter_module, "HeySDKWatch", FatalBeforeReadyWatch)
+
+    await instance._watch_supervisor()
+
+    surfaced = [str(record.exc_info[1]) for record in caplog.records if record.exc_info]
+    assert surfaced == [
+        "HEY SDK watch reported a fatal error: exact acknowledgement failure"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_fails_closed_on_malformed_fatal_frame_before_ready(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    import hey_platform.adapter as adapter_module
+
+    class MalformedFatalBeforeReadyWatch:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def lines(self):
+            yield {"type": "fatal", "error": "boom", "extra": True}
+
+        async def stop(self) -> None:
+            return None
+
+    instance = HeyAdapter(
+        Config(),
+        client=FakeSDKClient(),
+        state_path=tmp_path / "state.json",
+        platform=Platform.EMAIL,
+    )
+    instance.failure_threshold = 1
+
+    async def ignore_fatal_notification() -> None:
+        return None
+
+    instance._notify_fatal_error = ignore_fatal_notification
+    monkeypatch.setattr(
+        adapter_module, "HeySDKWatch", MalformedFatalBeforeReadyWatch
+    )
+
+    await instance._watch_supervisor()
+
+    surfaced = [str(record.exc_info[1]) for record in caplog.records if record.exc_info]
+    assert surfaced == ["HEY SDK watch sent a malformed fatal frame"]

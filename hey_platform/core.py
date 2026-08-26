@@ -117,6 +117,23 @@ def parse_ready_frame(value: dict[str, Any], protocol_version: int) -> None:
         raise ValueError("HEY SDK watch protocol mismatch")
 
 
+def parse_fatal_frame(value: dict[str, Any]) -> str | None:
+    """Return the sidecar's error text if *value* is a fatal frame, else None.
+
+    The sidecar closes a watch by emitting ``{"type": "fatal", "error": ...}``
+    (see sidecar/app.go). Recognising it here keeps the real cause in the log
+    instead of reporting the generic invalid-frame error.
+    """
+    if value.get("type") != "fatal":
+        return None
+    if set(value) != {"type", "error"}:
+        raise ValueError("HEY SDK watch sent a malformed fatal frame")
+    error = value["error"]
+    if type(error) is not str or not error.strip():
+        raise ValueError("HEY SDK watch sent a malformed fatal frame")
+    return error.strip()
+
+
 def parse_event_frame(value: dict[str, Any]) -> HeyEvent:
     if set(value) != {"type", "event"} or value.get("type") != "event":
         raise ValueError("HEY SDK watch returned an invalid post-ready frame")

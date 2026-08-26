@@ -28,6 +28,7 @@ from .core import (
     HeyEvent,
     parse_context_id,
     parse_event_frame,
+    parse_fatal_frame,
     parse_ready_frame,
     strict_bool,
 )
@@ -266,6 +267,11 @@ class HeyAdapter(BasePlatformAdapter):
                 async for raw in watch.lines():
                     if not ready_seen:
                         try:
+                            fatal = parse_fatal_frame(raw)
+                            if fatal is not None:
+                                raise ValueError(
+                                    f"HEY SDK watch reported a fatal error: {fatal}"
+                                )
                             parse_ready_frame(raw, HeySDKClient.PROTOCOL_VERSION)
                         except ValueError as exc:
                             raise RuntimeError(str(exc)) from None
@@ -299,6 +305,12 @@ class HeyAdapter(BasePlatformAdapter):
                 await asyncio.sleep(retry_delay)
 
     async def process_watch_line(self, raw: dict[str, Any]) -> None:
+        try:
+            fatal = parse_fatal_frame(raw)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
+        if fatal is not None:
+            raise RuntimeError(f"HEY SDK watch reported a fatal error: {fatal}")
         try:
             event = parse_event_frame(raw)
         except (KeyError, TypeError, ValueError) as exc:

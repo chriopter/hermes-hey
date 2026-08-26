@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -252,14 +253,21 @@ func (e *watchEngine) waitForAck(ctx context.Context, eventID string) error {
 		e.ackReader = bufio.NewReader(e.in)
 	}
 	var stopDeadlineWatch func()
+	// Deadline-based cancellation is an optimisation, not a requirement. When
+	// the gateway spawns us, stdin is a *blocking* pipe: Go cannot register it
+	// with the runtime poller, so SetReadDeadline reports ErrNoDeadline. Hard
+	// failing there aborted every watch right after the first event, which the
+	// host could only see as a fatal frame. Fall back to a plain blocking read
+	// instead — the parent terminates our process group on shutdown.
+	var deadliner readDeadliner
 	if ctx.Done() != nil {
-		deadliner, ok := e.in.(interface{ SetReadDeadline(time.Time) error })
-		if !ok {
-			return fmt.Errorf("ack input does not support cancellation")
+		var err error
+		deadliner, err = ackReadDeadliner(e.in)
+		if err != nil {
+			return err
 		}
-		if err := deadliner.SetReadDeadline(time.Time{}); err != nil {
-			return fmt.Errorf("prepare cancelable ack read: %w", err)
-		}
+	}
+	if deadliner != nil {
 		done := make(chan struct{})
 		watcherDone := make(chan struct{})
 		go func() {
@@ -299,6 +307,26 @@ func (e *watchEngine) waitForAck(ctx context.Context, eventID string) error {
 		return fmt.Errorf("invalid ack")
 	}
 	return nil
+}
+
+type readDeadliner interface {
+	SetReadDeadline(time.Time) error
+}
+
+// ackReadDeadliner returns deadline support when it is usable. Inputs without
+// deadline support (a blocking pipe, a plain file) are read normally.
+func ackReadDeadliner(in io.Reader) (readDeadliner, error) {
+	deadliner, ok := in.(readDeadliner)
+	if !ok {
+		return nil, nil
+	}
+	if err := deadliner.SetReadDeadline(time.Time{}); err != nil {
+		if errors.Is(err, os.ErrNoDeadline) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("acknowledgement deadline is unavailable")
+	}
+	return deadliner, nil
 }
 
 func readLimitedLine(reader *bufio.Reader, limit int) ([]byte, error) {

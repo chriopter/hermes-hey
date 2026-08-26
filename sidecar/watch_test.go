@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,30 @@ type fakeWatchAPI struct {
 	message     *generated.Message
 	changeCalls int
 	messageIDs  []int64
+}
+
+type rejectingDeadlineReader struct {
+	readCalls int
+}
+
+type noDeadlineReader struct {
+	*strings.Reader
+	deadlines []time.Time
+	err       error
+}
+
+func (r *noDeadlineReader) SetReadDeadline(deadline time.Time) error {
+	r.deadlines = append(r.deadlines, deadline)
+	return r.err
+}
+
+func (r *rejectingDeadlineReader) Read([]byte) (int, error) {
+	r.readCalls++
+	return 0, errors.New("read must not be attempted")
+}
+
+func (*rejectingDeadlineReader) SetReadDeadline(time.Time) error {
+	return errors.New("sensitive synthetic deadline failure")
 }
 
 func (f *fakeWatchAPI) ListBoxes(context.Context) ([]generated.Box, error) { return f.boxes, nil }
@@ -66,6 +91,29 @@ func TestWaitForAckReturnsWhenContextIsCanceled(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("waitForAck() did not return after cancellation")
+	}
+}
+
+func TestWaitForAckRejectsUnexpectedDeadlineProbeErrorPromptly(t *testing.T) {
+	reader := &rejectingDeadlineReader{}
+	engine := watchEngine{in: reader}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := time.Now()
+
+	err := engine.waitForAck(ctx, "synthetic-event")
+
+	if err == nil || !strings.Contains(err.Error(), "acknowledgement deadline") {
+		t.Fatalf("waitForAck() error = %v, want redacted acknowledgement deadline error", err)
+	}
+	if strings.Contains(err.Error(), "sensitive synthetic deadline failure") {
+		t.Fatalf("waitForAck() leaked deadline error: %v", err)
+	}
+	if reader.readCalls != 0 {
+		t.Fatalf("Read calls = %d, want zero after failed deadline probe", reader.readCalls)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("waitForAck() took %v, want prompt deadline failure", elapsed)
 	}
 }
 
@@ -218,5 +266,44 @@ func TestWatchSuppressesOwnSenderAndAdvances(t *testing.T) {
 	state, _, _ := loadCursorState(path)
 	if state.Boxes["11"].Since != next.Since {
 		t.Fatal("own event did not advance cursor")
+	}
+}
+
+func TestWaitForAckAcceptsInputWithoutDeadlineSupport(t *testing.T) {
+	// The gateway hands the sidecar a blocking pipe as stdin, which Go cannot
+	// register with the runtime poller — SetReadDeadline reports ErrNoDeadline
+	// there. waitForAck used to treat that as fatal, which aborted the watch
+	// after its very first event and put the host in a restart loop.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	engine := watchEngine{in: strings.NewReader("{\"ack\":\"synthetic-event\"}\n")}
+	if err := engine.waitForAck(ctx, "synthetic-event"); err != nil {
+		t.Fatalf("waitForAck() error = %v, want nil", err)
+	}
+}
+
+func TestWaitForAckFallsBackWhenReadDeadlinesAreUnsupported(t *testing.T) {
+	tests := map[string]error{
+		"direct":  os.ErrNoDeadline,
+		"wrapped": fmt.Errorf("wrapped unsupported deadline: %w", os.ErrNoDeadline),
+	}
+	for name, deadlineErr := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			reader := &noDeadlineReader{
+				Reader: strings.NewReader("{\"ack\":\"synthetic-event\"}\n"),
+				err:    deadlineErr,
+			}
+			engine := watchEngine{in: reader}
+
+			if err := engine.waitForAck(ctx, "synthetic-event"); err != nil {
+				t.Fatalf("waitForAck() error = %v, want blocking fallback", err)
+			}
+			if len(reader.deadlines) != 1 || !reader.deadlines[0].IsZero() {
+				t.Fatalf("SetReadDeadline calls = %v, want one zero-value probe", reader.deadlines)
+			}
+		})
 	}
 }
