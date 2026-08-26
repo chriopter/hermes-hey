@@ -58,16 +58,11 @@ func TestWatchEmitsMessagesAndCommentsFromSameThreadBurstChronologically(t *test
 		}
 	}
 	posting := testPosting()
-	posting.VisibleEntryCount = 5
+	posting.VisibleEntryCount = 4
 	api := &burstWatchAPI{
 		boxes:   []generated.Box{{Id: 11, Kind: "imbox"}},
 		changes: &hey.PostingChanges{Updated: []generated.Posting{posting}, NextCursor: &next},
 		entries: []generated.Entry{
-			{
-				Id: 44, Kind: "comment", Summary: "Agent response",
-				CreatedAt: time.Date(2026, 1, 2, 3, 6, 30, 0, time.UTC),
-				Creator:   generated.Contact{Id: 99, Name: "Agent", EmailAddress: "me@example.com"},
-			},
 			{Id: 43, Kind: "message"},
 			{
 				Id: 42, Kind: "comment", Summary: "Internal assignment",
@@ -122,5 +117,58 @@ func TestWatchEmitsMessagesAndCommentsFromSameThreadBurstChronologically(t *test
 	}
 	if state.Boxes["11"].Since != next.Since {
 		t.Fatal("cursor did not advance after both event acknowledgements")
+	}
+}
+
+func TestWatchDoesNotReplayOlderForeignEntrySelectedByVisibleCount(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "cursor.json")
+	old := hey.PostingChangesCursor{Since: "2026-01-02T03:04:00.000Z", Version: "1"}
+	next := hey.PostingChangesCursor{Since: "2026-01-02T03:07:00.000Z", Version: "1"}
+	if err := saveCursorState(path, cursorState{Version: 1, Boxes: map[string]hey.PostingChangesCursor{"11": old}}); err != nil {
+		t.Fatal(err)
+	}
+	posting := testPosting()
+	posting.VisibleEntryCount = 1
+	api := &burstWatchAPI{
+		boxes:   []generated.Box{{Id: 11, Kind: "imbox"}},
+		changes: &hey.PostingChanges{Updated: []generated.Posting{posting}, NextCursor: &next},
+		entries: []generated.Entry{
+			{
+				Id: 44, Kind: "comment", Summary: "Latest agent response",
+				CreatedAt: time.Date(2026, 1, 2, 3, 6, 30, 0, time.UTC),
+				Creator:   generated.Contact{Id: 99, Name: "Agent", EmailAddress: "me@example.com"},
+			},
+			{
+				Id: 43, Kind: "comment", Summary: "Earlier agent response",
+				CreatedAt: time.Date(2026, 1, 2, 3, 6, 0, 0, time.UTC),
+				Creator:   generated.Contact{Id: 99, Name: "Agent", EmailAddress: "me@example.com"},
+			},
+			{
+				Id: 42, Kind: "comment", Summary: "Historical assignment",
+				CreatedAt: time.Date(2026, 1, 2, 3, 3, 30, 0, time.UTC),
+				Creator:   generated.Contact{Id: 88, Name: "Collaborator", EmailAddress: "collaborator@example.com"},
+			},
+		},
+	}
+	var out bytes.Buffer
+	acks := "{\"ack\":\"thread:31:entry:42\"}\n"
+	engine := watchEngine{api: api, statePath: path, ownEmail: "me@example.com", out: &out, in: strings.NewReader(acks)}
+
+	if err := engine.poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("visible entry count replayed an entry older than the cursor: %q", out.String())
+	}
+	state, _, err := loadCursorState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Boxes["11"].Since != next.Since {
+		t.Fatal("cursor did not advance past the self-authored posting update")
 	}
 }

@@ -86,11 +86,6 @@ func hydratePostingSince(ctx context.Context, api hydrationAPI, posting generate
 	if err != nil {
 		return nil, err
 	}
-	active := visibleEventEntry(entries, int(posting.VisibleEntryCount))
-	var activeID int64
-	if active != nil {
-		activeID = active.Id
-	}
 	events := make([]*event, 0)
 	for _, entry := range entries {
 		if entry.Kind != "message" && entry.Kind != "comment" {
@@ -100,14 +95,10 @@ func hydratePostingSince(ctx context.Context, api hydrationAPI, posting generate
 		if err != nil {
 			return nil, err
 		}
-		isNew := createdAt.After(since)
-		if !isNew && entry.Id != activeID {
+		if !createdAt.After(since) {
 			break
 		}
 		events = append(events, event)
-		if !isNew {
-			break
-		}
 	}
 	for left, right := 0, len(events)-1; left < right; left, right = left+1, right-1 {
 		events[left], events[right] = events[right], events[left]

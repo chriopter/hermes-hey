@@ -215,7 +215,7 @@ func TestWatchRestartBeforeAckReplaysEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	next := hey.PostingChangesCursor{Since: "2026-01-02T03:05:05.000Z", Version: "1"}
-	api := &fakeWatchAPI{boxes: []generated.Box{{Id: 11, Kind: "imbox"}}, changes: map[int64]*hey.PostingChanges{11: {Added: []generated.Posting{testPosting()}, NextCursor: &next}}, entries: []generated.Entry{{Id: 41, Kind: "message"}}, message: &generated.Message{Id: 41, Creator: generated.Contact{EmailAddress: "sender@example.com"}}}
+	api := &fakeWatchAPI{boxes: []generated.Box{{Id: 11, Kind: "imbox"}}, changes: map[int64]*hey.PostingChanges{11: {Added: []generated.Posting{testPosting()}, NextCursor: &next}}, entries: []generated.Entry{{Id: 41, Kind: "message"}}, message: &generated.Message{Id: 41, CreatedAt: time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC), Creator: generated.Contact{EmailAddress: "sender@example.com"}}}
 	var first, second bytes.Buffer
 	engine := watchEngine{api: api, statePath: path, ownEmail: "me@example.com", out: &first, in: strings.NewReader("")}
 	_ = engine.poll(context.Background())
@@ -235,7 +235,7 @@ func TestWatchConsumesOneAckPerEventWithoutLosingBufferedInput(t *testing.T) {
 	second := testPosting()
 	second.Id, second.AppUrl = 22, "https://app.hey.com/topics/32"
 	next := hey.PostingChangesCursor{Since: "2026-01-02T03:05:05.000Z"}
-	api := &fakeWatchAPI{boxes: []generated.Box{{Id: 11, Kind: "imbox"}}, changes: map[int64]*hey.PostingChanges{11: {Added: []generated.Posting{testPosting(), second}, NextCursor: &next}}, entries: []generated.Entry{{Id: 41, Kind: "message"}}, message: &generated.Message{Id: 41, Creator: generated.Contact{EmailAddress: "sender@example.com"}}}
+	api := &fakeWatchAPI{boxes: []generated.Box{{Id: 11, Kind: "imbox"}}, changes: map[int64]*hey.PostingChanges{11: {Added: []generated.Posting{testPosting(), second}, NextCursor: &next}}, entries: []generated.Entry{{Id: 41, Kind: "message"}}, message: &generated.Message{Id: 41, CreatedAt: time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC), Creator: generated.Contact{EmailAddress: "sender@example.com"}}}
 	acks := "{\"ack\":\"thread:31:entry:41\"}\n{\"ack\":\"thread:32:entry:41\"}\n"
 	engine := watchEngine{api: api, statePath: path, ownEmail: "me@example.com", out: &bytes.Buffer{}, in: strings.NewReader(acks)}
 	if err := engine.poll(context.Background()); err != nil {
@@ -254,7 +254,7 @@ func TestWatchSuppressesOwnSenderAndAdvances(t *testing.T) {
 		t.Fatal(err)
 	}
 	next := hey.PostingChangesCursor{Since: "2026-01-02T03:05:05.000Z"}
-	api := &fakeWatchAPI{boxes: []generated.Box{{Id: 11, Kind: "imbox"}}, changes: map[int64]*hey.PostingChanges{11: {Updated: []generated.Posting{testPosting()}, NextCursor: &next}}, entries: []generated.Entry{{Id: 41, Kind: "message"}}, message: &generated.Message{Id: 41, Creator: generated.Contact{EmailAddress: " ME@EXAMPLE.COM "}}}
+	api := &fakeWatchAPI{boxes: []generated.Box{{Id: 11, Kind: "imbox"}}, changes: map[int64]*hey.PostingChanges{11: {Updated: []generated.Posting{testPosting()}, NextCursor: &next}}, entries: []generated.Entry{{Id: 41, Kind: "message"}}, message: &generated.Message{Id: 41, CreatedAt: time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC), Creator: generated.Contact{EmailAddress: " ME@EXAMPLE.COM "}}}
 	var out bytes.Buffer
 	engine := watchEngine{api: api, statePath: path, ownEmail: "me@example.com", out: &out, in: strings.NewReader("")}
 	if err := engine.poll(context.Background()); err != nil {

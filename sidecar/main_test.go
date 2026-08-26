@@ -177,6 +177,34 @@ func TestHydratePostingSinceReturnsMessagesAndCommentsChronologically(t *testing
 	}
 }
 
+func TestHydratePostingSinceKeepsNewForeignCommentBeforeOwnReply(t *testing.T) {
+	since := time.Date(2026, 1, 2, 3, 4, 0, 0, time.UTC)
+	api := &fakeHydrationAPI{entries: []generated.Entry{
+		{
+			Id: 303, Kind: "comment", Summary: "Agent response",
+			CreatedAt: since.Add(2 * time.Minute),
+			Creator:   generated.Contact{Id: 99, Name: "Agent", EmailAddress: "me@example.com"},
+		},
+		{
+			Id: 250, Kind: "comment", Summary: "New assignment",
+			CreatedAt: since.Add(time.Minute),
+			Creator:   generated.Contact{Id: 88, Name: "Collaborator", EmailAddress: "authorized@example.com"},
+		},
+	}}
+	posting := generated.Posting{
+		Id: 505, Kind: "topic", AppUrl: "https://app.hey.com/topics/606",
+		AccountId: 707, Name: "Synthetic subject", VisibleEntryCount: 2,
+	}
+
+	events, err := hydratePostingSince(context.Background(), api, posting, "imbox", since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].EntryID != 250 || events[1].EntryID != 303 {
+		t.Fatalf("hydratePostingSince() = %#v, want new foreign comment before own reply", events)
+	}
+}
+
 func TestHydratePostingBuildsActiveCommentWithoutMessageGet(t *testing.T) {
 	createdAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	api := &fakeHydrationAPI{entries: []generated.Entry{

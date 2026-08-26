@@ -8,7 +8,7 @@ Native [HEY](https://www.hey.com/) email and Collab platform adapter for [Hermes
 
 - Polls HEY's SDK posting-changes feeds with persisted per-box cursors.
 - Hydrates topic entries by type: `kind="message"` uses `Messages.Get`, while `kind="comment"` is read directly from the typed topic entry and is never treated as an email message.
-- Selects the exact position reported by `posting.visible_entry_count`; ambiguous events fail closed.
+- Emits only typed topic entries created strictly after the persisted box cursor; `posting.visible_entry_count` cannot force an older entry back into the queue.
 - Requires a Python acknowledgement after durable ingestion before advancing the SDK cursor. A restart before acknowledgement replays the event safely.
 - Ignores messages and Collab comments authored by the configured HEY identity.
 - Authorizes message senders and comment authors before writing event data to disk.

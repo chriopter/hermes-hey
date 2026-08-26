@@ -15,7 +15,7 @@ SDK box posting-changes cursor
         │ added/updated posting
         ▼
 SDK topic entries (typed, paginated)
-        │ exact posting.visible_entry_count position
+        │ entries strictly newer than persisted box cursor
         ├─ comment → typed entry; never Messages.Get
         ├─ message → SDK Messages.Get
         └─ other → skip
@@ -51,7 +51,7 @@ complete exact durable event identity
 
 - `thread:<thread-id>:entry:<entry-id>` is the immutable event identity and must match the frame's numeric IDs.
 - `thread:<thread-id>` is the stable Hermes conversation context.
-- `visible_entry_count` identifies the authoritative entry; position, kind, and range are validated fail closed.
+- The persisted box cursor bounds every hydrated burst; `visible_entry_count` never overrides that boundary to replay an older entry.
 - The configured account and email are verified before watch startup and every event is account-bound again in Python.
 - Own-address events are rejected in both sidecar and Python.
 
