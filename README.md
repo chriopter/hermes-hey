@@ -1,6 +1,6 @@
 # Hermes HEY
 
-Native [HEY](https://www.hey.com/) email platform adapter for [Hermes Agent](https://github.com/NousResearch/hermes-agent), built on Basecamp's official [`hey-sdk`](https://github.com/basecamp/hey-sdk).
+Native [HEY](https://www.hey.com/) email and Collab platform adapter for [Hermes Agent](https://github.com/NousResearch/hermes-agent), built on Basecamp's official [`hey-sdk`](https://github.com/basecamp/hey-sdk).
 
 > Technology preview. Runtime transport uses `hey-sdk/go` v0.24.0 through a small Go sidecar; the general HEY CLI is used only to create the OAuth credential store.
 
@@ -17,6 +17,15 @@ Native [HEY](https://www.hey.com/) email platform adapter for [Hermes Agent](htt
 - Serializes work per thread across adapter reconnects and rejects progress, error, media-fallback, and duplicate sends.
 
 Remote email and Collab comments are untrusted input. An authorized Collab comment is dispatched as an agent assignment. The adapter requires either an explicit `allow_from` list or the deliberate opt-in `allow_all_users: true`.
+
+### Email and Collab integration
+
+- An authorized inbound email (`kind="message"`) becomes a durable assignment and its final response is sent with HEY's email-reply operation.
+- An authorized inbound Collab comment (`kind="comment"`) becomes a durable assignment and its final response is posted with HEY's Collab-comment operation in the same thread.
+- The persisted inbound `kind` selects the outbound operation. Session metadata, model output, and fallback paths cannot turn a Collab assignment into email or an email assignment into a Collab comment.
+- Comment IDs are never passed to the message API. Typed comment entries already contain the data needed for authorization and dispatch.
+- A successful SDK `2xx` response or an exact same-thread redirect confirms a Collab mutation. API errors and ambiguous transport failures remain failures and are not blindly retried.
+- Python and sidecar communicate with wire protocol version 2. Mixed protocol-1/protocol-2 installations fail closed.
 
 ## Requirements
 
@@ -50,7 +59,7 @@ The CLI is not used for watch, hydration, identity checks, email replies, or Col
 ## Installation
 
 ```bash
-git clone --branch v0.2.0 --depth 1 https://github.com/chriopter/hermes-hey.git
+git clone --branch main --depth 1 https://github.com/chriopter/hermes-hey.git
 cd hermes-hey
 RELEASE_COMMIT="$(git rev-parse HEAD)"
 mkdir -p "$HOME/.local/bin"
@@ -59,6 +68,8 @@ hermes plugins install chriopter/hermes-hey --ref "$RELEASE_COMMIT" --enable
 ```
 
 Ensure `$HOME/.local/bin` is on the gateway's `PATH`. For a system service, `/usr/local/bin/hermes-hey-sidecar` is a suitable installation path.
+
+When upgrading, update the plugin and sidecar from the same commit, then restart the Hermes gateway. Protocol mismatches are rejected instead of routing an event through the wrong transport.
 
 For development, link the checkout into the active profile:
 
@@ -110,7 +121,7 @@ uvx ruff@0.16.4 check .
 uvx pyright@1.1.411
 (cd sidecar && go test -race ./...)
 (cd sidecar && go vet ./...)
-(cd sidecar && go build .)
+(cd sidecar && go build -trimpath -o /tmp/hermes-hey-sidecar .)
 uvx --from build==1.5.0 pyproject-build
 ```
 
